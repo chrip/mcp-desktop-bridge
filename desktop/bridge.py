@@ -33,7 +33,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -1078,7 +1078,10 @@ def _draw_grid(png_bytes: bytes, step: int = 100) -> bytes:
 
 @mcp.tool
 async def click(
-    x: Any, y: Any = None, button: str = "left", double: bool = False
+    x: Union[int, str, List[int]],
+    y: Optional[Union[int, str]] = None,
+    button: str = "left",
+    double: bool = False,
 ) -> Dict[str, Any]:
     """Click at absolute screen pixel coordinates, bypassing the DOM entirely.
 
