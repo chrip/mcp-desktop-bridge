@@ -226,6 +226,39 @@ level** while accepting `ctrl+a` — so a selection appears and then nothing is 
 no error. `press_key` now returns a `note` pointing at `browser_press` whenever you send a
 deletion key, because that combination is silent and cost real debugging time.
 
+## `thinking` — the speed/reliability trade-off in gui_task
+
+`gui_task(task, thinking=False)` controls whether the model emits a reasoning block
+before acting. It reaches vLLM as `chat_template_kwargs: {enable_thinking: …}`.
+
+The per-call speedup is dramatic. On one screenshot-and-click completion:
+
+| | output tokens | wall | result |
+|---|---|---|---|
+| thinking on | 700 | 29.6 s | hit the token cap while still reasoning — never answered |
+| thinking off | 35 | 2.7 s | correct coordinates |
+
+A vision turn is **~94% decode** (prefill of a full 1280x800 screenshot is only ~1.6 s of
+it), so reasoning tokens dominate wall-clock. That is why the difference is so large.
+
+**But faster per call is not faster per task.** The same multi-step action, one trial each:
+
+| | turns | wall | outcome |
+|---|---|---|---|
+| `thinking=False` | 6 (hit the cap) | 29.9 s | failed — three stray clicks, no terminal |
+| `thinking=True` | 3 | 28.1 s | succeeded — one precise click |
+
+Identical wall time, opposite outcome: without a reasoning block the model needed more
+turns and still missed. With thinking off it also reasons in the *content* channel
+instead, which is the same tokens without the benefit of being separated out.
+
+Rule of thumb from these measurements:
+
+- **`thinking=False`** for cheap single-shot reads — "what is on screen?", "which window
+  is focused?", one-step grounding. Measured 4.4 s versus 10.0 s, both correct.
+- **`thinking=True`** for anything multi-step or requiring judgement — locating a control,
+  recovering from a missed click, deciding whether a dialog is the right one.
+
 ## Timeouts — read this before using `gui_task`
 
 **opencode's remote-MCP `timeout` defaults to 5000 ms.** A single vision turn was

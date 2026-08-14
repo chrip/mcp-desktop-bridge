@@ -218,7 +218,7 @@ async def get_computer() -> Any:
 # --- 1. delegated vision loop -----------------------------------------------------
 @mcp.tool
 async def gui_task(
-    task: str, max_turns: int = 12, budget_s: int = 420
+    task: str, max_turns: int = 12, budget_s: int = 420, thinking: bool = False
 ) -> Dict[str, Any]:
     """Do something on the Ubuntu desktop using vision, in one delegated call.
 
@@ -234,7 +234,15 @@ async def gui_task(
         task: what to do, in plain language, e.g. "open the Files app and create a
             folder called demo on the Desktop".
         max_turns: safety cap on model turns before returning.
-        budget_s: wall-clock budget. When it runs out the tool RETURNS what it achieved
+        thinking: let the model emit a reasoning block before acting. Off by default,
+            and the difference is not marginal -- measured on one screenshot-and-click
+            turn: 700 output tokens / 29.6 s with thinking on (which hit the token cap
+            while still reasoning, so it never answered at all) versus 35 tokens / 2.7 s
+            with it off, for the same correct coordinates. A vision turn is ~94% decode,
+            so reasoning tokens dominate wall-clock. Turn it on for a step that needs
+            real judgement rather than "find this and click it".
+        budget_s: wall-clock budget (a turn is ~2-4 s with thinking off, ~20-30 s with
+            it on). When it runs out the tool RETURNS what it achieved
             so far with truncated=true, instead of running until the MCP client gives
             up. Keep this below your client's MCP timeout -- opencode's `timeout` for a
             remote MCP server defaults to only 5000 ms, so it must be raised in
@@ -263,9 +271,13 @@ async def gui_task(
         instructions=INSTRUCTIONS,
         telemetry_enabled=False,
         max_retries=3,
+        # Reaches vLLM as a body field and is applied by the chat template. Verified in
+        # place: the loop forwards every extra kwarg into litellm.acompletion, and
+        # litellm passes extra_body through to the OpenAI-compatible endpoint.
+        extra_body={"chat_template_kwargs": {"enable_thinking": thinking}},
     )
 
-    recorder.record("gui_task", task=task, model=MODEL)
+    recorder.record("gui_task", task=task, model=MODEL, thinking=thinking)
     messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
     texts: List[str] = []
     actions: List[str] = []
@@ -322,6 +334,7 @@ async def gui_task(
         "turns": turns,
         "truncated": truncated,
         "elapsed_s": round(time.monotonic() - started, 1),
+        "thinking": thinking,
         "actions": actions,
         "summary": "\n".join(t for t in texts if t) or "(model returned no text)",
         "trajectory": str(traj),
