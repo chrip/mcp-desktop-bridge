@@ -1,0 +1,22 @@
+# Real secrets. Copy .env-example to .env and fill it in.
+.env
+
+# Recorded GUI sessions: screenshots of whatever was on screen, model trajectories with
+# base64-embedded images, and generated replay scripts. These capture the contents of
+# whatever instance you were testing -- authenticated pages included -- so they are
+# deliberately never committed. The directory itself is kept, because it is a bind-mount
+# source: if it is missing, Docker creates it as root and the container (uid 1000)
+# cannot write into it.
+trajectories/*
+!trajectories/.gitkeep
+
+# Local machine wiring: docker networks of other stacks, extra mounts, host-specific
+# ports. Compose loads this automatically when present. See the .example file.
+docker-compose.override.yml
+
+# Editor and OS noise
+*.bak
+*~
+.DS_Store
+__pycache__/
+*.pyc

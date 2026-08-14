@@ -1,0 +1,22 @@
+# Local machine wiring -- NOT committed (.gitignore). Compose loads this automatically.
+#
+# This is what lets the desktop container reach the Nextcloud / Euro-Office stacks that
+# run as separate compose projects on this host, by joining their networks. That matters
+# for more than convenience: Nextcloud rejects any request whose Host header is not in
+# trusted_domains, so browsing by the hostname the stack already trusts avoids editing
+# its config. host.docker.internal would not work -- the dev proxy publishes only to
+# 127.0.0.1, which a container cannot reach, and the Host header would be wrong anyway.
+services:
+  desktop:
+    networks:
+      - default
+      - nextcloud-dev
+      - euro-office
+
+networks:
+  nextcloud-dev:
+    name: master_default
+    external: true
+  euro-office:
+    name: euro-officedevelopmentenvironment_default
+    external: true

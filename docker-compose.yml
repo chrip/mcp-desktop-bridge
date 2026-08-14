@@ -1,0 +1,244 @@
+# docker-compose.yml
+# vLLM serving for nvidia/Qwen3.6-27B-NVFP4 (official NVIDIA ModelOpt quant)
+# on DGX Spark (GB10, aarch64, 121 GiB unified memory).
+#
+# 1:1 swap from rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm.
+# Port 8000 and --served-model-name=qwen3.6-27b are unchanged, so opencode
+# needs no further edit -- it only ever sees the served name, not the weights.
+#
+# FIRST START DOWNLOADS ~21.94 GiB (3 shards) from HuggingFace. Expect a long
+# first boot. It lands in the bind-mounted host cache below and persists.
+#
+# The previous rdtand weights (19 GiB) stay in that same cache, so reverting is
+# a one-line change to the model arg with no re-download.
+#
+# Start:      docker compose up -d
+# vLLM logs:  docker compose logs -f vllm
+# Test vLLM:  curl -sS http://127.0.0.1:8000/v1/models | jq -r '.data[0].id'
+
+services:
+  vllm:
+    # Pinned by digest to the exact arm64 image this box already runs:
+    # vLLM 0.23.0 / torch 2.11.0+cu130. ':latest' floats and would eventually
+    # change under you, taking the CUDA build with it.
+    image: vllm/vllm-openai@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f
+    container_name: qwen-3.6-27b-spark
+    restart: unless-stopped
+    ipc: host
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # The old "60" was simply the default and did nothing. Raised to give
+      # long-context prefill and CUDA graph capture real headroom.
+      VLLM_ENGINE_ITERATION_TIMEOUT_S: "600"
+      HF_TOKEN: ${HF_TOKEN:?HF_TOKEN is not set - see .env}
+
+    volumes:
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+      # torch.compile / CUDA graph cache lives in /root/.cache/vllm, which the
+      # HF mount above does not cover. Persisting it saves the ~53 s
+      # recompilation on every restart.
+      - vllm-compile-cache:/root/.cache/vllm
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    command:
+      - nvidia/Qwen3.6-27B-NVFP4
+      # TWO names for the same weights, and the second one is load-bearing.
+      # cua's agent loop for this architecture registers itself as
+      #   @register_agent(models=r"(?i).*qwen35.*", priority=1)
+      # so a model string containing "qwen35" is what selects loops/qwen35.py.
+      # "qwen3.6-27b" does NOT match that regex, and the miss is silent: cua would
+      # fall back to generic_vlm (the r".*" catch-all at priority -100) and simply
+      # drive the GUI worse, with nothing in the logs to explain why.
+      # "qwen3.6-27b" stays first and unchanged, so opencode needs no edit.
+      #
+      # Deliberately NOT written as --served-model-name=a b: this option is
+      # nargs="+", and the "=" form would pass the single string "a b" as one name.
+      - --served-model-name
+      - qwen3.6-27b
+      - qwen35-27b
+      - --host=0.0.0.0
+      - --port=8000
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+
+      # NOTE: deliberately NO --quantization flag. This checkpoint declares
+      # quant_method=modelopt / quant_algo=MIXED_PRECISION, and vLLM's
+      # auto-detection resolves that unambiguously to `modelopt_mixed`
+      # (verified against this image: only that backend claims the config).
+      # NVIDIA's own model card suggests `--quantization modelopt`, but that
+      # name selects the plain-FP8 config class, which does NOT accept a
+      # MIXED_PRECISION checkpoint. Letting vLLM detect it is the correct path.
+      # Layout: MLPs are W4A16_NVFP4 (group_size 16), the linear-attention
+      # projections are FP8, and the vision tower + MTP head stay BF16.
+
+      # max_position_embeddings is 262144 in this checkpoint too.
+      - --max-model-len=262144
+
+      # 121 GiB unified memory, SHARED with the running desktop (Xorg +
+      # gnome-shell). 0.5 -> ~60 GiB budget: ~21.9 GiB weights + ~36 GiB KV
+      # pool, leaving ~46 GiB to the OS. The old 0.7 (~85 GiB) was tight for a
+      # box that also drives a display.
+      - --gpu-memory-utilization=0.5
+
+      # LOAD-BEARING for this checkpoint. NVIDIA declares FP8 KV via a
+      # `kv_cache_scheme` dict rather than the `kv_cache_quant_algo` string, and
+      # the mixed-precision config path does not pick that up automatically
+      # (kv_cache_quant_algo resolved to None when tested). So fp8 KV only
+      # happens if we ask for it here.
+      # Only 16 of 64 layers are full attention (4 kv heads x 256 head_dim); the
+      # other 48 are linear/Mamba with constant-size state. At fp8 that is
+      # 32 KiB/token, so one full 262144-token request costs ~8.6 GiB
+      # -> roughly 4 concurrent max-length requests.
+      # If the engine refuses to start, this is the first line to drop.
+      - --kv-cache-dtype=fp8
+
+      # opencode is effectively a single-user client. 8 is ample and keeps the
+      # KV reservation bounded (default is far higher).
+      - --max-num-seqs=8
+
+      # The old 4096 was what forced MTP down to k=1 and produced the
+      # max_num_scheduled_tokens warning. 8192 gives the drafter room.
+      - --max-num-batched-tokens=8192
+      - --enable-chunked-prefill
+      - --enable-prefix-caching
+
+      # Off by default (enable_prompt_tokens_details = False). Without it vLLM
+      # sends "prompt_tokens_details": null and every OpenAI-compatible client
+      # reports 0 cached tokens even though prefix caching is working fine.
+      # Metrics only -- no effect on generation. Populates
+      # usage.prompt_tokens_details.cached_tokens, which opencode maps to
+      # cachedInputTokens ("Cache Tokens read").
+      - --enable-prompt-tokens-details
+
+      # This checkpoint ships an MTP head (15 tensors) that NVIDIA excluded from
+      # quantization, so the drafter runs in BF16 -- if anything that should
+      # help acceptance rate versus the previous quantized head.
+      # "mtp" is a member of vLLM's EagleModelTypes, which is why it is
+      # compatible with --async-scheduling below (verified against 0.23.0 -- a
+      # non-Eagle method would hard-fail rather than silently disable).
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
+      - --async-scheduling
+
+      # Qwen3.6 is a thinking model; without this its <think> blocks arrive
+      # inside `content` instead of `reasoning_content` and leak into every
+      # visible answer. "qwen3" is a registered parser name in this image.
+      - --reasoning-parser=qwen3
+
+      - --enable-auto-tool-choice
+      # qwen3_coder, NOT qwen3_xml. Both parse this model's markup
+      # (<tool_call> / <function= / <parameter=), but the qwen3_xml parser
+      # explicitly sets name=None on argument-continuation deltas, which
+      # serializes as "name": null. The OpenAI spec says continuation chunks
+      # omit `name`, and opencode's @ai-sdk/openai-compatible schema accepts
+      # string|undefined but not null -> "Expected 'function.name' to be a
+      # string." qwen3_coder leaves name unset, so it is omitted correctly.
+      - --tool-call-parser=qwen3_coder
+
+      # NOT included: --load-format=fastsafetensors from the NVIDIA DGX recipe.
+      # It does not exist in 0.23.0 and only affects weight-load time anyway.
+
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15m
+      retries: 5
+
+  # Ubuntu XFCE desktop for GUI testing and GUI scripting, driven by the vllm service
+  # above. Watch it at http://127.0.0.1:6901 -- log in as "kasm_user" (UNDERSCORE; the
+  # Linux account is kasm-user with a hyphen, but the KasmVNC login is not) with $VNC_PW.
+  #
+  # No GPU is requested: the model runs in the vllm container, this one only needs
+  # pixels and hands. Costs roughly 1-2 GiB of the shared 121 GiB.
+  desktop:
+    build:
+      context: ./desktop
+    image: local/cua-desktop-arm64:0.8.4
+    container_name: qwen-gui-desktop
+    restart: unless-stopped
+
+    # Firefox needs more than the default 64 MiB of /dev/shm or tabs crash.
+    shm_size: 1gb
+
+    # How the container reaches the model. vLLM listens on the host, not in this
+    # container, so host.docker.internal is mapped to the docker bridge gateway.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Reaching OTHER docker stacks (e.g. a Nextcloud/Office dev environment) is done in
+    # docker-compose.override.yml, not here, so that a fresh clone starts without needing
+    # any of them to exist. Compose loads that file automatically when it is present.
+    # See docker-compose.override.yml.example -- it also explains why joining a stack's
+    # network beats host.docker.internal for anything that validates the Host header.
+
+    ports:
+      # KasmVNC web viewer -- this is the "visually" part.
+      - "127.0.0.1:6901:6901"
+      # computer-server. Deliberately NOT 8000 on the host: vLLM already owns that
+      # port. Inside the container it stays 8000.
+      - "127.0.0.1:8001:8000"
+      # gui-bridge MCP endpoint that opencode connects to.
+      # Host side is 8766, not 8765: a pre-existing `python3 -m http.server 8765`
+      # already owns 8765 on this box. Container side stays 8765.
+      - "127.0.0.1:8766:8765"
+
+    environment:
+      # 1280x800: ~1.2-1.6k image tokens per screenshot after Qwen smart_resize.
+      # NOTE: KasmVNC ignores this and starts at 1024x768; custom_startup.sh corrects
+      # it with xrandr after boot. Keep both in agreement.
+      VNC_RESOLUTION: 1280x800
+      # The base image ships a well-known default password. Even though every port is
+      # bound to loopback only, don't run with it.
+      VNC_PW: ${VNC_PW:?VNC_PW is not set - see .env}
+      # "qwen35-27b" must match cua's loop-selection regex r"(?i).*qwen35.*" --
+      # see the --served-model-name comment in the vllm service.
+      CUA_MODEL_NAME: openai/qwen35-27b
+      OPENAI_BASE_URL: http://host.docker.internal:8000/v1
+      OPENAI_API_KEY: EMPTY
+      CUA_MAX_IMAGES: "3"
+      CUA_TELEMETRY_ENABLED: "false"
+
+    volumes:
+      # Persistent home: the browser profile lives here, so you log into a site once
+      # by hand at :6901 and later tasks start already authenticated. The model never
+      # needs to see a password.
+      - desktop-home:/home/kasm-user
+      # Recorded sessions and generated replay scripts, readable from the host.
+      - ./trajectories:/trajectories
+
+    # vLLM must be answering before the desktop's agent loop is useful. The vllm
+    # healthcheck has a 15m start_period, so this can wait a long time on a cold boot.
+    depends_on:
+      vllm:
+        condition: service_healthy
+
+    # NOTE on the 6901 check: KasmVNC answers 401 until you authenticate, and `curl -f`
+    # treats any 4xx as failure (exit 22). The obvious `curl -sf http://localhost:6901`
+    # therefore marks a perfectly working desktop as unhealthy forever. Accept 401 as
+    # proof the web viewer is listening, and check the gui-bridge MCP port too -- an
+    # unresponsive bridge is what actually makes this service useless to opencode.
+    healthcheck:
+      test: ["CMD", "bash", "-c",
+             "curl -sf http://localhost:8000/status >/dev/null && \
+              curl -s -o /dev/null -w '%{http_code}' http://localhost:6901 | grep -qE '^(200|401)$$' && \
+              (exec 3<>/dev/tcp/127.0.0.1/8765) 2>/dev/null"]
+      interval: 30s
+      timeout: 10s
+      start_period: 3m
+      retries: 5
+
+volumes:
+  vllm-compile-cache:
+  desktop-home:
