@@ -132,6 +132,21 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(f"fastmcp is required inside the container: {exc}")
 
+# EVERY TOOL DECLARES AT LEAST ONE REQUIRED PARAMETER, deliberately.
+#
+# Measured against this stack: with a realistic tool list (23 bridge tools plus the
+# client's own), a tool whose parameters are ALL optional makes the model emit a bare
+# "{" as its arguments and stop, which the client rejects with
+#   Invalid input for tool X: JSON parsing failed: Text: {
+# and then the model retries the same malformed call. It is not a temperature effect --
+# 4/8 malformed at temperature 1.0, 5/8 at 0.3 -- and it is not a parser bug, since the
+# same tool called in isolation returns a clean "{}". Marking one parameter required
+# took it to 0/8.
+#
+# So where optionality is meaningful the parameter is required but NULLABLE: the caller
+# must write {"session_id": null} rather than {}, which costs nothing and keeps the
+# behaviour. The three tools that genuinely took no arguments carry a required `reason`
+# instead, which also lands in the trajectory and makes a session easier to read.
 mcp = FastMCP("desktop-gui-bridge")
 
 
@@ -389,7 +404,7 @@ async def get_page() -> Any:
 
 @mcp.tool
 async def browser_open(
-    url: Optional[str] = None, urls: Optional[List[str]] = None
+    url: Optional[str], urls: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """Open the browser on the desktop, optionally at a URL. Safe to call repeatedly.
 
@@ -538,7 +553,7 @@ async def _resolve_frame(page: Any, chain: Optional[str]) -> Any:
 
 
 @mcp.tool
-async def browser_frames() -> Dict[str, Any]:
+async def browser_frames(reason: str) -> Dict[str, Any]:
     """List the iframes on the page, so you know what to pass as `frame`.
 
     Call this first when working with a Nextcloud office document, a viewer, or any
@@ -704,7 +719,7 @@ async def browser_click(
 
 
 @mcp.tool
-async def browser_scroll(dy: int = 600, dx: int = 0) -> Dict[str, Any]:
+async def browser_scroll(dy: int, dx: int = 0) -> Dict[str, Any]:
     """Scroll the page by a pixel delta. Positive dy scrolls down."""
     page = await get_page()
     await page.mouse.wheel(dx, dy)
@@ -714,7 +729,7 @@ async def browser_scroll(dy: int = 600, dx: int = 0) -> Dict[str, Any]:
 
 @mcp.tool
 async def browser_read(
-    selector: str = "body", max_chars: int = 4000, frame: Optional[str] = None
+    selector: str, max_chars: int = 4000, frame: Optional[str] = None
 ) -> Dict[str, Any]:
     """Read visible text from the page as text, not pixels.
 
@@ -857,7 +872,7 @@ async def browser_find(
 
 
 @mcp.tool
-async def browser_close() -> Dict[str, Any]:
+async def browser_close(reason: str) -> Dict[str, Any]:
     """Close the browser, flushing the profile so logins persist."""
     global _ctx, _page
     async with _browser_lock:
@@ -865,13 +880,13 @@ async def browser_close() -> Dict[str, Any]:
             await _ctx.close()
         _ctx = None
         _page = None
-    recorder.record("browser_close")
+    recorder.record("browser_close", reason=reason)
     return {"ok": True}
 
 
 # --- 3. eyes for opencode ---------------------------------------------------------
 @mcp.tool
-async def screenshot(grid: bool = False) -> Any:
+async def screenshot(grid: bool) -> Any:
     """Take a screenshot of the whole desktop, to check the state yourself.
 
     The reply also carries a text line with the screen size and the currently FOCUSED
@@ -928,7 +943,7 @@ async def screenshot(grid: bool = False) -> Any:
 
 
 @mcp.tool
-async def focus_browser() -> Dict[str, Any]:
+async def focus_browser(reason: str) -> Dict[str, Any]:
     """Give keyboard focus back to the Firefox window before typing.
 
     THE most common cause of a vision session going wrong: keystrokes land in whatever
@@ -960,7 +975,7 @@ async def focus_browser() -> Dict[str, Any]:
     title = await _active_title() or ""
     focused = any(mark in title for mark in ("Nightly", "Firefox", "Mozilla"))
 
-    recorder.record("focus_browser", window=str(win_id), focused=focused)
+    recorder.record("focus_browser", window=str(win_id), focused=focused, reason=reason)
     if focused:
         return {
             "ok": True, "activated": str(win_id), "matched_by": how,
@@ -1194,7 +1209,7 @@ async def press_key(key: str, times: int = 1) -> Dict[str, Any]:
 
 
 @mcp.tool
-async def scroll_screen(clicks: int = 3, down: bool = True) -> Dict[str, Any]:
+async def scroll_screen(clicks: int, down: bool = True) -> Dict[str, Any]:
     """Scroll the X display with the mouse wheel, wherever the pointer is.
 
     Move the pointer first with desktop_click if the wrong pane scrolls.
@@ -1253,7 +1268,7 @@ async def browser_eval(expression: str, frame: Optional[str] = None) -> Dict[str
 
 
 @mcp.tool
-async def browser_console(limit: int = 50, level: Optional[str] = None) -> Dict[str, Any]:
+async def browser_console(limit: int, level: Optional[str] = None) -> Dict[str, Any]:
     """Recent browser console output and uncaught page errors.
 
     Collected continuously from the moment the browser starts, so a message logged before
@@ -1283,7 +1298,7 @@ async def browser_console(limit: int = 50, level: Optional[str] = None) -> Dict[
 
 
 @mcp.tool
-async def session_timeline(session_id: Optional[str] = None) -> Dict[str, Any]:
+async def session_timeline(session_id: Optional[str]) -> Dict[str, Any]:
     """Recorded actions with the elapsed time between them.
 
     Timing is evidence. A GUI bug that only appears when a step takes too long is
@@ -1337,7 +1352,7 @@ def _target_expr(entry: Dict[str, Any]) -> str:
 
 
 @mcp.tool
-async def list_sessions(limit: int = 20) -> Dict[str, Any]:
+async def list_sessions(limit: int) -> Dict[str, Any]:
     """List recorded sessions that can be turned into replay scripts."""
     files = sorted(TRAJECTORY_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime,
                    reverse=True)[:limit]
@@ -1353,7 +1368,7 @@ async def list_sessions(limit: int = 20) -> Dict[str, Any]:
 
 
 @mcp.tool
-async def emit_replay_script(session_id: Optional[str] = None) -> Dict[str, Any]:
+async def emit_replay_script(session_id: Optional[str]) -> Dict[str, Any]:
     """Turn a recorded session into a standalone Playwright script.
 
     The result runs with NO model in the loop: deterministic, fast and cheap enough

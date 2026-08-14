@@ -207,6 +207,36 @@ the slowest gap. Timing is evidence: a bug that only appears when a step takes t
 invisible in a list of actions and obvious in the gaps. This is what identified a 60 s
 timeout as the cause of a wrong document, by showing `+70.0s` before the confirming click.
 
+## Every tool has a required parameter, on purpose
+
+If a tool's parameters are **all optional**, this model emits a bare `{` as its arguments
+and stops, and the client rejects the call:
+
+```
+Invalid input for tool desktop_screenshot: JSON parsing failed: Text: {
+```
+
+It then retries the same malformed call, so a session can stall on it. Measured with a
+realistic tool list (23 bridge tools plus the client's own):
+
+| schema | malformed |
+|---|---|
+| `grid` optional, temperature 1.0 | 4/8 |
+| `grid` optional, temperature 0.3 | 5/8 |
+| **`grid` required** | **0/8** |
+
+Not a temperature effect, and not a parser bug — the same tool called in isolation returns
+a clean `{}`. It only appears once the tool list is large.
+
+So every tool here declares at least one required parameter. Where optionality is
+meaningful the parameter is **required but nullable**: you write `{"session_id": null}`
+instead of `{}`, which costs nothing and changes no behaviour. The three tools that took no
+arguments at all (`browser_frames`, `browser_close`, `focus_browser`) take a required
+`reason` instead, which also lands in the trajectory and makes a session easier to read.
+
+**Keep this rule when adding a tool.** A new all-optional tool will look fine in testing
+and fail intermittently in a real session.
+
 ## Key names: either spelling works, but the path matters
 
 `press_key` (X level) and `browser_press` (Playwright) expect **different spellings** —
