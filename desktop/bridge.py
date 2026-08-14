@@ -4,7 +4,7 @@ gui-bridge: the MCP surface that opencode on the host talks to.
 
 Runs INSIDE the desktop container. Three groups of tools:
 
-  gui_task(...)       delegated vision loop. Qwen3.6 on the host decides, cua's
+  gui_task(...)       delegated vision loop. The local model on the host decides, cua's
                       qwen35 loop drives the mouse/keyboard. One call per instruction;
                       the screenshot traffic never crosses opencode's context.
   browser_*(...)      Playwright with real CSS selectors against the visible Firefox.
@@ -43,7 +43,7 @@ log = logging.getLogger("gui-bridge")
 # --- configuration ----------------------------------------------------------------
 # "qwen35-27b" is not a typo and is load-bearing: cua selects its agent loop by
 # regex on the model string, and loops/qwen35.py registers as r"(?i).*qwen35.*".
-# A name like "qwen3.6-27b" misses that regex silently and falls back to the
+# A name like "qwen3.8-27b" misses that regex silently and falls back to the
 # generic_vlm catch-all. vLLM serves both names for the same weights.
 MODEL = os.environ.get("CUA_MODEL_NAME", "openai/qwen35-27b")
 API_BASE = os.environ.get("OPENAI_BASE_URL", "http://host.docker.internal:8000/v1")
@@ -222,7 +222,7 @@ async def gui_task(
 ) -> Dict[str, Any]:
     """Do something on the Ubuntu desktop using vision, in one delegated call.
 
-    The local Qwen3.6 model looks at screenshots and drives the mouse and keyboard
+    The local model looks at screenshots and drives the mouse and keyboard
     until the task is done. Use this for anything that is not a web page: launching
     apps, window management, file manager, dialogs -- and for web pages when you do
     not know the selectors.

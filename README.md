@@ -39,7 +39,7 @@ a real timing bug in an office suite's Smart Picker, which is documented in
   repin the base image.
 - **Docker** with Compose v2+ and the NVIDIA container runtime (for the vLLM service).
 - **A vision-capable model** served over an OpenAI-compatible API. The bundled compose
-  file runs `nvidia/Qwen3.6-27B-NVFP4` in vLLM; anything that accepts images works.
+  file runs `unsloth/Qwen3.8-27B-NVFP4` in vLLM; anything that accepts images works.
 - **An MCP client.** Developed against [opencode](https://opencode.ai); any MCP client
   that speaks streamable HTTP will do.
 - Roughly **30 GB** disk: ~22 GB model weights, ~5 GB desktop image.
@@ -64,8 +64,9 @@ Then point your MCP client at the bridge:
 }
 ```
 
-That `timeout` is not optional — opencode's default is **5000 ms**, and a single vision
-turn takes ~20 s, so the vision tool can never finish inside it. See
+That `timeout` is not optional — opencode's default is **5000 ms**, while a single vision
+turn takes seconds to tens of seconds (measured 7 s to 26 s depending on the model and
+whether the model reasons first), so the vision tool can never finish inside it. See
 [desktop/README.md](desktop/README.md#timeouts--read-this-before-using-gui_task).
 
 Watch the desktop at <http://127.0.0.1:6901> — user **`kasm_user`** (underscore), password

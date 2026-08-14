@@ -1,16 +1,24 @@
 # docker-compose.yml
-# vLLM serving for nvidia/Qwen3.6-27B-NVFP4 (official NVIDIA ModelOpt quant)
-# on DGX Spark (GB10, aarch64, 121 GiB unified memory).
+# vLLM serving for unsloth/Qwen3.8-27B-NVFP4 on DGX Spark
+# (GB10, aarch64, 121 GiB unified memory).
 #
-# 1:1 swap from rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm.
-# Port 8000 and --served-model-name=qwen3.6-27b are unchanged, so opencode
-# needs no further edit -- it only ever sees the served name, not the weights.
+# Swapped from nvidia/Qwen3.6-27B-NVFP4. Same architecture
+# (Qwen3_5ForConditionalGeneration, 64 layers: 16 full-attention + 48 linear,
+# 4 KV heads x 256 head_dim, 262144 context), so every tuning flag below still
+# applies and the desktop bridge needs no change at all -- see the
+# --served-model-name note.
 #
-# FIRST START DOWNLOADS ~21.94 GiB (3 shards) from HuggingFace. Expect a long
-# first boot. It lands in the bind-mounted host cache below and persists.
+# NVFP4 was chosen over the official Qwen/Qwen3.8-27B-FP8 (28.7 GiB) on measured
+# grounds: a GUI turn is ~94% decode and decode at batch 1 is memory-bandwidth
+# bound, so wall-clock tracks weight size. 21.8 GiB holds the ~24 tok/s this box
+# was doing; FP8 would cost roughly 30-40% per turn for no benefit here, since
+# its advantage would land in prefill, which is only ~1.6 s of a ~26 s turn.
 #
-# The previous rdtand weights (19 GiB) stay in that same cache, so reverting is
-# a one-line change to the model arg with no re-download.
+# FIRST START DOWNLOADS ~21.8 GiB from HuggingFace. Expect a long first boot.
+# It lands in the bind-mounted host cache below and persists.
+#
+# The 3.6 weights (20.4 GiB) stay in that same cache, so reverting is a two-line
+# change to the model arg and served name, with no re-download.
 #
 # Start:      docker compose up -d
 # vLLM logs:  docker compose logs -f vllm
@@ -53,35 +61,41 @@ services:
               capabilities: [gpu]
 
     command:
-      - nvidia/Qwen3.6-27B-NVFP4
+      - unsloth/Qwen3.8-27B-NVFP4
       # TWO names for the same weights, and the second one is load-bearing.
       # cua's agent loop for this architecture registers itself as
       #   @register_agent(models=r"(?i).*qwen35.*", priority=1)
       # so a model string containing "qwen35" is what selects loops/qwen35.py.
-      # "qwen3.6-27b" does NOT match that regex, and the miss is silent: cua would
+      # "qwen3.8-27b" does NOT match that regex, and the miss is silent: cua would
       # fall back to generic_vlm (the r".*" catch-all at priority -100) and simply
       # drive the GUI worse, with nothing in the logs to explain why.
-      # "qwen3.6-27b" stays first and unchanged, so opencode needs no edit.
+      # "qwen35-27b" is byte-identical across the 3.6 -> 3.8 swap, which is why the
+      # bridge needed no change. Only the first name follows the model version,
+      # and that is the one opencode's provider config points at.
       #
       # Deliberately NOT written as --served-model-name=a b: this option is
       # nargs="+", and the "=" form would pass the single string "a b" as one name.
       - --served-model-name
-      - qwen3.6-27b
+      - qwen3.8-27b
       - qwen35-27b
       - --host=0.0.0.0
       - --port=8000
       - --tensor-parallel-size=1
       - --trust-remote-code
 
-      # NOTE: deliberately NO --quantization flag. This checkpoint declares
-      # quant_method=modelopt / quant_algo=MIXED_PRECISION, and vLLM's
-      # auto-detection resolves that unambiguously to `modelopt_mixed`
-      # (verified against this image: only that backend claims the config).
-      # NVIDIA's own model card suggests `--quantization modelopt`, but that
-      # name selects the plain-FP8 config class, which does NOT accept a
-      # MIXED_PRECISION checkpoint. Letting vLLM detect it is the correct path.
-      # Layout: MLPs are W4A16_NVFP4 (group_size 16), the linear-attention
-      # projections are FP8, and the vision tower + MTP head stay BF16.
+      # NOTE: deliberately NO --quantization flag; vLLM auto-detects.
+      # This checkpoint is compressed-tensors, NOT modelopt like the 3.6 one was:
+      # quant_method=compressed-tensors with format="mixed-precision", meaning each
+      # config group carries its own format. Verified supported by this image:
+      # compressed_tensors 0.17.0 lists both "mixed-precision" and
+      # "nvfp4-pack-quantized" in CompressionFormat, and vLLM applies quant_format
+      # per group (CompressedTensorsW4A4Fp4 is present).
+      # Layout: MLPs are W4A4 NVFP4 (group_size 16) except the last 8 layers;
+      # attention projections, lm_head and those last-8 MLPs are FP8; the vision
+      # tower is in the ignore list, so it stays unquantized.
+      # Note W4A4 is more aggressive than the 3.6 build's W4A16 -- 4-bit
+      # activations too. If GUI grounding accuracy ever looks worse, that is the
+      # first thing to suspect, and Qwen/Qwen3.8-27B-FP8 is the conservative swap.
 
       # max_position_embeddings is 262144 in this checkpoint too.
       - --max-model-len=262144
@@ -92,11 +106,10 @@ services:
       # box that also drives a display.
       - --gpu-memory-utilization=0.5
 
-      # LOAD-BEARING for this checkpoint. NVIDIA declares FP8 KV via a
-      # `kv_cache_scheme` dict rather than the `kv_cache_quant_algo` string, and
-      # the mixed-precision config path does not pick that up automatically
-      # (kv_cache_quant_algo resolved to None when tested). So fp8 KV only
-      # happens if we ask for it here.
+      # Kept explicit. This checkpoint declares FP8 KV via a `kv_cache_scheme`
+      # dict (num_bits 8, static, per-tensor), and the equivalent dict on the 3.6
+      # build was NOT picked up automatically, so asking for it here is what
+      # actually guaranteed fp8 KV. Harmless if the backend also infers it.
       # Only 16 of 64 layers are full attention (4 kv heads x 256 head_dim); the
       # other 48 are linear/Mamba with constant-size state. At fp8 that is
       # 32 KiB/token, so one full 262144-token request costs ~8.6 GiB
@@ -122,16 +135,17 @@ services:
       # cachedInputTokens ("Cache Tokens read").
       - --enable-prompt-tokens-details
 
-      # This checkpoint ships an MTP head (15 tensors) that NVIDIA excluded from
-      # quantization, so the drafter runs in BF16 -- if anything that should
-      # help acceptance rate versus the previous quantized head.
+      # This checkpoint ships an MTP head (15 tensors, same as the 3.6 build) that
+      # is excluded from quantization, so the drafter runs unquantized.
+      # Speculative decoding is also why measured tok/s can exceed what raw memory
+      # bandwidth would allow: several tokens land per forward pass.
       # "mtp" is a member of vLLM's EagleModelTypes, which is why it is
       # compatible with --async-scheduling below (verified against 0.23.0 -- a
       # non-Eagle method would hard-fail rather than silently disable).
       - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
       - --async-scheduling
 
-      # Qwen3.6 is a thinking model; without this its <think> blocks arrive
+      # Qwen3.8 is a thinking model; without this its <think> blocks arrive
       # inside `content` instead of `reasoning_content` and leak into every
       # visible answer. "qwen3" is a registered parser name in this image.
       - --reasoning-parser=qwen3

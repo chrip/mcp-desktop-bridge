@@ -1,5 +1,10 @@
 # GUI agent on DGX Spark: opencode (host) -> local Qwen3.6 -> Ubuntu desktop container
 
+> **Note:** this records the original bring-up against Qwen3.6-27B. The stack has
+> since moved to Qwen3.8-27B (same `qwen3_5` architecture, so the `qwen35` alias and
+> the bridge were unchanged). Left as written, because it is a record of what was
+> verified at the time.
+>
 > **STATUS: built and verified end-to-end on 2026-08-14.** See `desktop/README.md` for
 > how to use it. This document is the design record and the list of things that were
 > tested rather than assumed. Where reality differed from the plan, the "as built"

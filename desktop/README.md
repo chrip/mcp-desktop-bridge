@@ -454,7 +454,7 @@ Two real limits:
 ## Gotchas worth knowing
 
 - **The model name `qwen35-27b` is load-bearing.** cua picks its agent loop by regex on
-  the model string (`r"(?i).*qwen35.*"`). vLLM serves both `qwen3.6-27b` (for opencode)
+  the model string (`r"(?i).*qwen35.*"`). vLLM serves both `qwen3.8-27b` (for opencode)
   and `qwen35-27b` (for cua) from the same weights. Renaming it silently degrades GUI
   performance to a generic fallback loop with nothing in the logs.
 - **Firefox is the browser because it was the easiest path, not on principle.** It ships in
