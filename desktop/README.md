@@ -360,6 +360,51 @@ nobody connected, and was measured at **1500x803** with a browser attached. So:
 - This does not affect `gui_task`, whose loop works in normalised 0-1000 coordinates
   scaled to the current screenshot, nor the `browser_*` selector tools.
 
+## Reading a canvas: `read_screen`
+
+`read_screen(question, region, scale)` takes a screenshot, asks the local model your
+question about it, and returns **text**. One call, no image for you to interpret, no
+action loop. It is the answer to "what does the document say?" on a canvas editor.
+
+```
+read_screen "Transcribe the text in the document body exactly." region=[340,400,400,60]
+   -> "Hello http://nextcloud.local/index.php/u/bob"      145 prompt tokens, 0.8 s
+```
+
+**Crop; do not reflexively zoom.** Measured on a URL in a document at 1280x800, two runs
+each, every one transcribed exactly:
+
+| view | time | prompt tokens |
+|---|---|---|
+| full frame | 1.3 s | 1065 |
+| region, scale 1 | **0.8 s** | **149** |
+| region, scale 3 | 0.9 s | 293 |
+| region, scale 6 | 1.2 s | 890 |
+
+Cropping is a 7x token saving; magnifying adds cost without accuracy at readable sizes.
+Raise `scale` only when the text really is tiny, and avoid extreme aspect ratios — a
+780x70 strip at 4x returned a hallucinated HTML document, where a squarer crop of the same
+line read perfectly.
+
+`screenshot` takes the same `region` and `scale`. When you zoom, the grid keeps labelling
+**true screen coordinates**, so a coordinate read off a magnified crop can go straight to
+`click()` with no arithmetic.
+
+### Why `browser_read` now warns you
+
+On this editor, `browser_read(selector="body", frame="#euroofficeFrame >>> iframe")` returns
+`"File Home Insert Draw Layout References…"` — the **ribbon**. Real DOM, looks like a
+successful read, and contains none of the document. That is worse than an empty result,
+because it invites the conclusion "the document is not in the DOM" and then a hunt for the
+data elsewhere. One agent went as far as `docker exec`, unzipping the `.docx`, and running
+`xwd -root` with hand-rolled PIL cropping to read a line that `read_screen` transcribes in
+under a second.
+
+So `browser_read` now always reports `canvas_elements`, and when any exist it attaches a
+note: their rendered content is not in the text, use `read_screen`, and **do not** go
+looking for the file on disk — the rendered state is the truth, and it can legitimately
+differ from the saved file (unsaved or detached sessions).
+
 ## Driving it by vision (the right tool for office documents)
 
 Selectors lose to the Nextcloud office case, and it is worth being explicit about why:

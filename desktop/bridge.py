@@ -745,17 +745,41 @@ async def browser_read(
             gui_task to judge those visually.
     """
     page = await get_page()
-    text = await _scope(page, frame).locator(_inner(selector, frame)).inner_text(
-        timeout=12000
-    )
+    scope = _scope(page, frame)
+    text = await scope.locator(_inner(selector, frame)).inner_text(timeout=12000)
     truncated = len(text) > max_chars
-    return {
+    out: Dict[str, Any] = {
         "ok": True,
         "url": page.url,
         "title": await page.title(),
         "text": text[:max_chars],
         "truncated": truncated,
     }
+
+    # Always ask whether this scope paints to a canvas, not just when the text came back
+    # empty. Reading the editor frame's body returns the RIBBON -- "File Home Insert Draw
+    # Layout..." -- which is real DOM and looks like a successful read, while containing
+    # none of the document. That is more misleading than an empty string: an agent sees
+    # text, concludes the document is not in the DOM, and goes looking for it on disk
+    # (observed: shelling into containers and unzipping the .docx).
+    try:
+        canvases = await scope.locator("canvas").count()
+    except Exception:
+        canvases = 0
+    out["canvas_elements"] = canvases
+
+    if canvases:
+        out["note"] = (
+            f"this scope contains {canvases} canvas element(s). Anything they render -- "
+            "the document body, a chart, a preview -- is NOT in the text above and cannot "
+            "be read from the DOM at all. Use read_screen(question=...) for it. Do not go "
+            "looking for the document on disk or in a server cache; the rendered state is "
+            "the truth, and it can legitimately differ from the saved file."
+        )
+    elif not text.strip():
+        out["hint"] = ("no text matched. Check the selector, or pass `frame` "
+                       "(browser_frames lists them).")
+    return out
 
 
 FINDER_JS = """
@@ -886,8 +910,10 @@ async def browser_close(reason: str) -> Dict[str, Any]:
 
 # --- 3. eyes for opencode ---------------------------------------------------------
 @mcp.tool
-async def screenshot(grid: bool) -> Any:
-    """Take a screenshot of the whole desktop, to check the state yourself.
+async def screenshot(
+    grid: bool, region: Optional[List[int]] = None, scale: float = 1.0
+) -> Any:
+    """Take a screenshot of the desktop, optionally zoomed into a region.
 
     The reply also carries a text line with the screen size and the currently FOCUSED
     window. Read both before acting:
@@ -900,9 +926,15 @@ async def screenshot(grid: bool) -> Any:
       focus_browser first.
 
     Args:
-        grid: overlay a labelled 100 px coordinate grid. Turn this on when you intend to
-            click by pixel -- reading a coordinate off a ruled, numbered grid is far
-            more reliable than estimating it from a bare image.
+        grid: overlay a labelled coordinate grid. Turn this on when you intend to click
+            by pixel -- reading a coordinate off a ruled, numbered grid is far more
+            reliable than estimating it from a bare image. The labels are always TRUE
+            SCREEN coordinates, including on a zoomed crop, so what you read is what you
+            can pass to click() with no arithmetic.
+        region: [x, y, width, height] in screen pixels to crop to.
+        scale: magnification, 0.25 to 6. Use 2-4 together with `region` to read small
+            text such as a URL in a document; at full-frame size that text is a few
+            pixels tall and transcribing it is guesswork.
     """
     # Via the Computer SDK rather than computer-server's /cmd: that endpoint returns a
     # STREAMING response ("Backup endpoint for when WebSocket connections fail"), not a
@@ -915,8 +947,9 @@ async def screenshot(grid: bool) -> Any:
     else:
         raw_bytes = shot
 
+    raw_bytes, offset, factor = _crop_and_scale(raw_bytes, region, scale)
     if grid:
-        raw_bytes = _draw_grid(raw_bytes)
+        raw_bytes = _draw_grid(raw_bytes, offset=offset, scale=factor)
     raw_b64 = base64.b64encode(raw_bytes).decode()
 
     meta = {"active_window": await _active_title()}
@@ -933,9 +966,13 @@ async def screenshot(grid: bool) -> Any:
         # Both parts come back: the picture, plus the coordinate space and focus state
         # it belongs to. Returning the image alone invites clicking with a stale
         # coordinate system or typing into the wrong window.
+        view = ""
+        if region or factor != 1.0:
+            view = (f" view=region{list(region) if region else 'full'}@{factor:g}x"
+                    f" (grid labels and click() both use full-screen coordinates)")
         return [
             f"screen={meta['screen']} focused_window={meta['active_window']!r} "
-            f"(coordinates are valid for this size only)",
+            f"(coordinates are valid for this size only){view}",
             Image(data=raw_bytes, format="png"),
         ]
     except Exception:  # fall back to base64 text if this fastmcp lacks Image
@@ -1063,11 +1100,58 @@ def _xy(x: Any, y: Any = None) -> tuple[int, int]:
     return int(x), int(y)
 
 
-def _draw_grid(png_bytes: bytes, step: int = 100) -> bytes:
-    """Overlay a labelled coordinate grid, to make pixel-accurate clicking practical.
+def _crop_and_scale(
+    png_bytes: bytes, region: Optional[List[int]], scale: float
+) -> tuple[bytes, tuple[int, int], float]:
+    """Crop to a region and magnify it. Returns (png, (offset_x, offset_y), scale).
 
-    Estimating "roughly 40% across" from a bare screenshot is where vision clicking goes
-    wrong; reading a number off a ruled line does not have that failure mode.
+    Small text is the whole reason this exists. A URL in a document is a handful of pixels
+    tall inside a 1500x803 frame, and asking a model to transcribe it from the full frame
+    is asking it to guess. Cropping to the line and enlarging it turns a guess into
+    reading -- an agent otherwise resorts to `xwd -root` inside the container and
+    hand-rolled PIL cropping, which is how one run ended up parsing an xwd header and
+    getting the channel order wrong.
+    """
+    if not region and (not scale or scale == 1.0):
+        return png_bytes, (0, 0), 1.0
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        log.warning("Pillow unavailable; returning the uncropped screenshot")
+        return png_bytes, (0, 0), 1.0
+
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    off = (0, 0)
+    if region and len(region) >= 4:
+        x, y, w, h = (int(v) for v in region[:4])
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(img.width, x0 + max(1, w)), min(img.height, y0 + max(1, h))
+        if x1 > x0 and y1 > y0:
+            img = img.crop((x0, y0, x1, y1))
+            off = (x0, y0)
+        else:
+            log.warning("region %s does not intersect the screen; ignoring", region)
+    factor = float(scale or 1.0)
+    if factor != 1.0:
+        factor = max(0.25, min(6.0, factor))
+        img = img.resize((int(img.width * factor), int(img.height * factor)),
+                         Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), off, factor
+
+
+def _draw_grid(
+    png_bytes: bytes, step: int = 100,
+    offset: tuple[int, int] = (0, 0), scale: float = 1.0,
+) -> bytes:
+    """Overlay a coordinate grid labelled in ORIGINAL screen coordinates.
+
+    The labels deliberately do not describe the image you are looking at: they describe
+    the screen. So a coordinate read off a cropped, magnified view can be passed straight
+    to click() without any arithmetic -- which is the point, because a model doing that
+    conversion by hand is a bug waiting to happen.
     """
     try:
         import io
@@ -1079,18 +1163,137 @@ def _draw_grid(png_bytes: bytes, step: int = 100) -> bytes:
     img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     draw = ImageDraw.Draw(img)
     w, h = img.size
-    for x in range(step, w, step):
-        draw.line([(x, 0), (x, h)], fill=(255, 0, 0), width=1)
-        # label twice so a number is near wherever you happen to be looking
-        for ly in (2, h - 12):
-            draw.text((x + 2, ly), str(x), fill=(255, 0, 0))
-    for y in range(step, h, step):
-        draw.line([(0, y), (w, y)], fill=(0, 90, 255), width=1)
-        for lx in (2, w - 34):
-            draw.text((lx, y + 2), str(y), fill=(0, 90, 255))
+    ox, oy = offset
+    # step down the ruling when magnified, or the lines crowd the text they annotate
+    eff = max(10, int(step / max(1.0, scale)))
+
+    first_x = ((ox + eff - 1) // eff) * eff
+    x = first_x
+    while (x - ox) * scale < w:
+        px = int((x - ox) * scale)
+        if px > 0:
+            draw.line([(px, 0), (px, h)], fill=(255, 0, 0), width=1)
+            for ly in (2, h - 12):
+                draw.text((px + 2, ly), str(x), fill=(255, 0, 0))
+        x += eff
+
+    first_y = ((oy + eff - 1) // eff) * eff
+    y = first_y
+    while (y - oy) * scale < h:
+        py = int((y - oy) * scale)
+        if py > 0:
+            draw.line([(0, py), (w, py)], fill=(0, 90, 255), width=1)
+            for lx in (2, w - 40):
+                draw.text((lx, py + 2), str(y), fill=(0, 90, 255))
+        y += eff
+
     out = io.BytesIO()
     img.save(out, format="PNG")
     return out.getvalue()
+
+
+@mcp.tool
+async def read_screen(
+    question: str,
+    region: Optional[List[int]] = None,
+    scale: Optional[float] = None,
+    max_tokens: int = 400,
+) -> Dict[str, Any]:
+    """Ask a question about what is on screen and get a TEXT answer back.
+
+    This is how you read a canvas. Anything rendered rather than marked up -- a document
+    in an office editor, a chart, a PDF -- has no DOM to query, and browser_read correctly
+    returns an empty string for it. That empty string is not evidence the content is
+    missing; it means the question has to be asked visually.
+
+    Use this instead of hunting for the underlying data. The rendered screen is the truth
+    you are testing: a document's saved file can legitimately differ from what the editor
+    shows (unsaved or detached session state), so reading the file answers a different
+    question than the one you asked. Reaching for `xwd`, container shells or unzipping the
+    document is a sign this tool was the answer.
+
+    One screenshot, one model call, one text answer -- no image to interpret yourself and
+    no action loop. For *doing* something rather than reading, use gui_task.
+
+    Args:
+        question: what you want to know, e.g. "transcribe the document text exactly",
+            "is there an error dialog?", "which list entry is highlighted?".
+        region: optional [x, y, width, height] crop in screen pixels. Worth using for
+            small text: cropping to the line makes it far more legible than the same text
+            inside a full frame, and costs fewer image tokens.
+        scale: magnification, 1 by default. Measured on a URL in a document at 1280x800,
+            two runs each, all transcribed exactly:
+
+              full frame        1.3 s   1065 prompt tokens
+              region, scale 1   0.8 s    149 prompt tokens
+              region, scale 3   0.9 s    293
+              region, scale 6   1.2 s    890
+
+            So crop to save tokens, but do not enlarge reflexively -- at readable sizes it
+            only costs. Raise it when the text really is tiny. Avoid extreme aspect ratios:
+            a 780x70 strip at 4x produced a hallucinated HTML document instead of the
+            text, where a squarer crop of the same line read perfectly.
+        max_tokens: cap on the answer length.
+
+    Returns:
+        answer, plus the screen size, region and scale, so you can tell what was looked at.
+    """
+    computer = await get_computer()
+    shot = await computer.interface.screenshot()
+    raw = base64.b64decode(shot) if isinstance(shot, str) else shot
+
+    try:
+        size = await computer.interface.get_screen_size()
+        screen = f"{size.get('width')}x{size.get('height')}"
+    except Exception:
+        screen = "unknown"
+
+    factor = 1.0 if scale is None else float(scale)
+    raw, _offset, factor = _crop_and_scale(raw, region, factor)
+
+    b64 = base64.b64encode(raw).decode()
+    payload = {
+        "model": MODEL.split("/", 1)[-1],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        # Reading is a single-shot question; a reasoning block would multiply the latency
+        # for no benefit (measured ~10x on this kind of prompt).
+        "chat_template_kwargs": {"enable_thinking": False},
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
+            {"type": "text", "text":
+                "Answer only from what is visible in this screenshot. If the answer is "
+                "text, transcribe it exactly, including punctuation and spacing. If it "
+                "is not visible, say so plainly.\n\n" + question},
+        ]}],
+    }
+
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                API_BASE.rstrip("/") + "/chat/completions",
+                json=payload, headers={"Authorization": f"Bearer {API_KEY}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "hint": "is the model endpoint reachable? see OPENAI_BASE_URL"}
+
+    msg = (data.get("choices") or [{}])[0].get("message") or {}
+    answer = clean_text(msg.get("content") or "") or "(the model returned no text)"
+    recorder.record("read_screen", question=question, region=region, scale=factor)
+    return {
+        "ok": True,
+        "question": question,
+        "answer": answer,
+        "screen": screen,
+        "region": region,
+        "scale": factor,
+        "usage": data.get("usage", {}),
+    }
 
 
 # --- 3b. X-level vision primitives ------------------------------------------------
