@@ -20,9 +20,11 @@ your agent (opencode, …)  ──MCP/HTTP──>  gui-bridge  ──>  Ubuntu X
 
 Because the thing under test needs both, in the same session, on the same screen:
 
-- **A canvas has no DOM.** Reading the document through selectors returns an *empty
-  string* while the text is plainly visible on screen — so a DOM-only agent is not merely
-  blind, it is confidently blind: it gets a valid empty result instead of an error.
+- **A canvas has no DOM.** Reading the document through selectors returns text that does
+  not contain it — on one editor, the frame's `body` yields the *ribbon* ("File Home
+  Insert…") and nothing of the document. So a DOM-only agent is not merely blind, it is
+  confidently blind: it gets a plausible result instead of an error. `read_screen` answers
+  those questions visually instead.
 - **The controls are real DOM**, but nested two frames deep and cross-origin, while the
   dialogs they open are rendered by the *parent* page and talk back via postMessage. No
   single selector scope is ever the right one.
@@ -76,13 +78,14 @@ Watch the desktop at <http://127.0.0.1:6901> — user **`kasm_user`** (underscor
 
 ## The tools
 
-23 tools in four groups. Your MCP client prefixes them with the server name, so
+24 tools in four groups. Your MCP client prefixes them with the server name, so
 `screenshot` appears as `desktop_screenshot`.
 
 | Vision (X level — works on anything you can see) | |
 |---|---|
 | `gui_task` | delegated loop: the local model looks at screenshots and drives the mouse until the task is done |
-| `screenshot` | screenshot, optionally with a labelled coordinate grid; also reports screen size and the focused window |
+| `read_screen` | **ask a question about the screen, get text back.** How you read a canvas: no DOM needed, no image to interpret, no action loop |
+| `screenshot` | screenshot, optionally cropped, zoomed and with a labelled coordinate grid; also reports screen size and the focused window |
 | `click` | click a pixel |
 | `type_text` | type into whatever has focus |
 | `press_key` | key or chord |
