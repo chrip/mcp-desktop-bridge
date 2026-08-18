@@ -5,8 +5,11 @@ gui-bridge: the MCP surface that opencode on the host talks to.
 Runs INSIDE the desktop container. Three groups of tools:
 
   gui_task(...)       delegated vision loop. The local model on the host decides, cua's
-                      qwen35 loop drives the mouse/keyboard. One call per instruction;
-                      the screenshot traffic never crosses opencode's context.
+                      qwen35 loop drives the mouse/keyboard. Hand it a whole block of
+                      clicking, not one action: the screenshot traffic never crosses
+                      opencode's context, and its turns are cheap because it carries no
+                      context but the task. Ask for a `report` to get the outcome back as
+                      a fact rather than as the loop's own opinion of itself.
   browser_*(...)      Playwright with real CSS selectors against the visible Firefox.
                       This is the precise path -- no pixel guessing for logins/links.
   emit_replay_script  turn a recorded session into a runnable script with NO model
@@ -49,6 +52,30 @@ MODEL = os.environ.get("CUA_MODEL_NAME", "openai/qwen35-27b")
 API_BASE = os.environ.get("OPENAI_BASE_URL", "http://host.docker.internal:8000/v1")
 API_KEY = os.environ.get("OPENAI_API_KEY", "EMPTY")  # vLLM ignores it, litellm wants one
 MAX_IMAGES = int(os.environ.get("CUA_MAX_IMAGES", "3"))
+
+# Qwen3.8 exposes reasoning depth as `reasoning_effort`, and its chat template DEFAULTS TO
+# 'xhigh' -- so an unconfigured request gets the most expensive setting there is. Measured
+# on one code-reasoning question, temperature 0, all seven answers correct:
+#
+#     xhigh (= the default, and 'high' aliases to it)   1396 output tokens   60-66 s
+#     medium                                             885                 38.4 s
+#     low                                                620                 24.7 s
+#     none (identical to enable_thinking=False)           61                  2.9 s
+#
+# vLLM's API layer also accepts 'max' and 'minimal', but the Qwen3.8 template raises on
+# them and the request fails with HTTP 400 -- so they are rejected here instead, with a
+# message that says why.
+EFFORTS = ("none", "low", "medium", "xhigh")
+EFFORT_ALIASES = {"high": "xhigh"}  # the template does this itself; mirrored for clarity
+EFFORT_REJECTED = ("max", "minimal")
+# How many times gui_task re-prompts a loop that stopped talking instead of acting.
+MAX_NUDGES = int(os.environ.get("CUA_MAX_NUDGES", "3"))
+NUDGE = (
+    "You stopped without performing an action. Look at the CURRENT screen, work out "
+    "which step of the task above is still outstanding, and CARRY IT OUT NOW -- emit the "
+    "click or keypress, do not describe it. If every step is genuinely finished, reply "
+    "with the single word DONE."
+)
 TRAJECTORY_DIR = Path(os.environ.get("TRAJECTORY_DIR", "/trajectories"))
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8765"))
 # Separator for nested-iframe chains, e.g. "#euroofficeFrame >>> iframe".
@@ -189,6 +216,94 @@ def clean_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _norm_effort(effort: str) -> tuple[Optional[str], Optional[str]]:
+    """Normalise an effort level. Returns (value, error) with exactly one of them set."""
+    e = EFFORT_ALIASES.get((effort or "").lower(), (effort or "").lower())
+    if e in EFFORTS:
+        return e, None
+    if e in EFFORT_REJECTED:
+        return None, (
+            f"reasoning_effort={effort!r} is accepted by vLLM's API layer but the Qwen3.8 "
+            f"chat template raises on it, so the request fails with HTTP 400. Supported: "
+            f"{', '.join(EFFORTS)} ('high' is accepted as an alias for 'xhigh')."
+        )
+    return None, f"unknown effort {effort!r}; supported: {', '.join(EFFORTS)}"
+
+
+async def _ask_screen(
+    question: str,
+    region: Optional[List[int]] = None,
+    scale: Optional[float] = None,
+    max_tokens: int = 400,
+    effort: str = "medium",
+) -> Dict[str, Any]:
+    """One screenshot, one single-shot vision call, one text answer.
+
+    Shared by read_screen and by gui_task's `report`, so that a delegated loop's claim
+    of success and an independent look at the screen are produced by the same code path.
+    """
+    effort, bad = _norm_effort(effort)
+    if bad:
+        return {"ok": False, "error": bad}
+
+    computer = await get_computer()
+    shot = await computer.interface.screenshot()
+    raw = base64.b64decode(shot) if isinstance(shot, str) else shot
+
+    try:
+        size = await computer.interface.get_screen_size()
+        screen = f"{size.get('width')}x{size.get('height')}"
+    except Exception:
+        screen = "unknown"
+
+    factor = 1.0 if scale is None else float(scale)
+    raw, _offset, factor = _crop_and_scale(raw, region, factor)
+
+    b64 = base64.b64encode(raw).decode()
+    payload = {
+        "model": MODEL.split("/", 1)[-1],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        # Reading is a single-shot question, so the model must not be left at the
+        # template's 'xhigh' default. See EFFORTS for the measurements behind this.
+        "reasoning_effort": effort,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
+            {"type": "text", "text":
+                "Answer only from what is visible in this screenshot. If the answer is "
+                "text, transcribe it exactly, including punctuation and spacing. If it "
+                "is not visible, say so plainly.\n\n" + question},
+        ]}],
+    }
+
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                API_BASE.rstrip("/") + "/chat/completions",
+                json=payload, headers={"Authorization": f"Bearer {API_KEY}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "hint": "is the model endpoint reachable? see OPENAI_BASE_URL"}
+
+    msg = (data.get("choices") or [{}])[0].get("message") or {}
+    answer = clean_text(msg.get("content") or "") or "(the model returned no text)"
+    return {
+        "ok": True,
+        "question": question,
+        "answer": answer,
+        "screen": screen,
+        "region": region,
+        "scale": factor,
+        "effort": effort,
+        "usage": data.get("usage", {}),
+    }
+
+
 # --- the computer handle (shared by the vision loop) -------------------------------
 _computer: Any = None
 _computer_lock = asyncio.Lock()
@@ -233,7 +348,14 @@ async def get_computer() -> Any:
 # --- 1. delegated vision loop -----------------------------------------------------
 @mcp.tool
 async def gui_task(
-    task: str, max_turns: int = 12, budget_s: int = 420, thinking: bool = False
+    task: str,
+    report: Optional[str] = None,
+    report_region: Optional[List[int]] = None,
+    report_scale: Optional[float] = None,
+    max_turns: int = 30,
+    budget_s: int = 420,
+    effort: str = "none",
+    report_effort: str = "medium",
 ) -> Dict[str, Any]:
     """Do something on the Ubuntu desktop using vision, in one delegated call.
 
@@ -242,33 +364,98 @@ async def gui_task(
     apps, window management, file manager, dialogs -- and for web pages when you do
     not know the selectors.
 
+    DELEGATE A WHOLE BLOCK OF GUI WORK HERE rather than stepping through it yourself with
+    click/type_text/screenshot. Profiled on one real session: driving a 22-action GUI
+    sequence from the caller took 22 caller turns and 342 s, because every action needs a
+    second turn to look at the result, and each of those turns re-decodes the caller's
+    whole context (source files, earlier tool output, the conversation). This loop carries
+    only the task text and the last few screenshots, so its turns are far cheaper -- and
+    the caller pays for exactly one tool result instead of 22.
+
+    Keep for yourself the things that need your context: deciding WHAT to test, and
+    judging what the outcome means. Hand over the clicking.
+
+    ONE THING IT CANNOT DO: the loop only has X-level input, so DELETION KEYS DO NOT WORK
+    in a canvas editor. Measured in Euro-Office: it pressed ctrl+a (selection appeared),
+    pressed Delete, saw the text still there, correctly diagnosed "the Delete didn't
+    register", re-clicked and retried -- and burned 17 turns and 207 s never getting past
+    it, because no number of retries can fix it. Clear text YOURSELF with `browser_press`
+    (Playwright dispatches into the frame, which works) and hand the loop a task that only
+    types and clicks. Typing and clicking at X level are fine; only deletion is silent.
+
     For web work where reliability matters (logins, forms, precise clicks), prefer the
     browser_* tools instead: they use real selectors and cannot misclick.
 
     Args:
         task: what to do, in plain language, e.g. "open the Files app and create a
             folder called demo on the Desktop".
-        max_turns: safety cap on model turns before returning.
-        thinking: let the model emit a reasoning block before acting. Off by default,
-            and the difference is not marginal -- measured on one screenshot-and-click
-            turn: 700 output tokens / 29.6 s with thinking on (which hit the token cap
-            while still reasoning, so it never answered at all) versus 35 tokens / 2.7 s
-            with it off, for the same correct coordinates. A vision turn is ~94% decode,
-            so reasoning tokens dominate wall-clock. Turn it on for a step that needs
-            real judgement rather than "find this and click it".
-        budget_s: wall-clock budget (a turn is ~2-4 s with thinking off, ~20-30 s with
-            it on). When it runs out the tool RETURNS what it achieved
+        report: a question about the FINAL state of the screen, e.g. "transcribe the
+            first line of the document exactly". Answered after the loop stops by a
+            fresh screenshot and a separate single-shot vision call, and returned as
+            `report_answer`. Pass this whenever the point of the task is to find
+            something out, which is nearly always.
+
+            Do not trust `summary` for that. `summary` is the loop's own narration, and
+            a loop that has been told to accomplish something tends to report that it
+            did; it is also written while the last action's effect may not have rendered
+            yet. `report_answer` is an independent observation, and it is produced even
+            when the loop truncates or fails -- which is when you most need to know what
+            is actually on screen.
+        report_region: [x, y, width, height] crop for the report, in screen pixels.
+            **Pass this whenever you ask about specific text.** Measured failure without
+            it: asked to transcribe a document line, the full-frame answer came back as
+            the browser's ADDRESS BAR url -- the most url-shaped text on screen, in the
+            wrong window entirely, stated with no hesitation. A crop makes the question
+            unambiguous, and costs fewer image tokens (149 versus 1065 prompt tokens on a
+            single line). Take a screenshot first if you do not know the coordinates.
+        report_scale: magnification for the report crop, 1 by default. Raise only for
+            genuinely tiny text; see read_screen for the measurements.
+        max_turns: safety cap on model turns before returning. Budget about **2.5 turns
+            per action** you asked for: the loop takes a screenshot and checks it after
+            each step, which is what makes it reliable. Measured: a 12-action dialog flow
+            (dismiss dialog, clear line, type, filter a list, pick an entry, confirm)
+            used all 24 turns it was given and stopped one click short of finishing. The
+            default is deliberately generous because `budget_s` is the safer guard --
+            turns are cheap at ~4 s each, wall-clock is what your MCP client cares about.
+        effort: how hard the loop reasons per turn -- 'none' (default), 'low', 'medium' or
+            'xhigh'. **Never leave this unset in your own client**: Qwen3.8's chat template
+            defaults to 'xhigh', so an unconfigured GUI loop reasons at maximum depth about
+            where to click, and a vision turn is ~94% decode.
+
+            Measured on the same 9-action Smart Picker flow, both reaching the identical
+            correct end state:
+
+              effort='xhigh'   36 turns   16.6 s/turn   598 s
+              effort='none'    22 turns    3.7 s/turn    81 s
+
+            Reliability used to argue for reasoning -- without it the loop stalled. Nudges
+            (see MAX_NUDGES) fix stalling far more cheaply, so 'none' is the default. Raise
+            it only when a step needs judgement about WHAT to do, not about where to click.
+        report_effort: reasoning depth for the `report` question only, default 'medium'.
+            Separate from `effort` on purpose: the loop wants speed per turn, while the
+            single report call is the one answer you are going to trust, and 'none' was
+            measured dropping a line's leading character. See read_screen.
+        budget_s: wall-clock budget (a turn is ~4 s at effort='none', ~17 s at
+            'xhigh'). When it runs out the tool RETURNS what it achieved
             so far with truncated=true, instead of running until the MCP client gives
             up. Keep this below your client's MCP timeout -- opencode's `timeout` for a
             remote MCP server defaults to only 5000 ms, so it must be raised in
             opencode.json for this tool to be usable at all.
 
     Returns:
-        summary of what the model said, the actions it took, and the trajectory id.
-        A truncated result is still useful: the actions already happened on screen, so
-        call again to continue rather than starting over.
+        `report_answer` (what the screen shows at the end, if you asked), `summary` (what
+        the loop claimed), the actions it took, and the trajectory id. A truncated result
+        is still useful: the actions already happened on screen, so call again to continue
+        rather than starting over.
     """
     from cua_agent import ComputerAgent
+
+    effort, bad = _norm_effort(effort)
+    if bad:
+        return {"ok": False, "error": f"effort: {bad}"}
+    report_effort, bad = _norm_effort(report_effort)
+    if bad:
+        return {"ok": False, "error": f"report_effort: {bad}"}
 
     computer = await get_computer()
     traj = TRAJECTORY_DIR / recorder.session_id
@@ -286,56 +473,78 @@ async def gui_task(
         instructions=INSTRUCTIONS,
         telemetry_enabled=False,
         max_retries=3,
-        # Reaches vLLM as a body field and is applied by the chat template. Verified in
-        # place: the loop forwards every extra kwarg into litellm.acompletion, and
-        # litellm passes extra_body through to the OpenAI-compatible endpoint.
-        extra_body={"chat_template_kwargs": {"enable_thinking": thinking}},
+        # Reaches vLLM as a top-level body field. Verified in place: the loop forwards
+        # every extra kwarg into litellm.acompletion, and litellm passes extra_body
+        # through to the OpenAI-compatible endpoint.
+        extra_body={"reasoning_effort": effort},
     )
 
-    recorder.record("gui_task", task=task, model=MODEL, thinking=thinking)
+    recorder.record("gui_task", task=task, model=MODEL, effort=effort)
     messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
     texts: List[str] = []
     actions: List[str] = []
     turns = 0
     truncated = False
+    nudges = 0
     started = time.monotonic()
 
     try:
-        async for result in agent.run(messages):
-            turns += 1
-            for item in result.get("output", []) or []:
-                itype = item.get("type")
-                if itype == "message":
-                    content = item.get("content")
-                    if isinstance(content, str):
-                        texts.append(clean_text(content))
-                    elif isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("text"):
-                                texts.append(clean_text(part["text"]))
-                elif itype == "computer_call":
-                    action = item.get("action") or {}
-                    name = action.get("type") or action.get("action") or "?"
-                    detail = {
-                        k: v for k, v in action.items() if k not in ("type", "action")
-                    }
-                    actions.append(f"{name}({json.dumps(detail, default=str)})")
-                    recorder.record("agent_action", action=name, params=detail)
-            if turns >= max_turns:
-                truncated = True
-                log.warning("gui_task hit max_turns=%s", max_turns)
+        while True:
+            hit_limit = False
+            last_turn_acted = False
+            async for result in agent.run(messages):
+                turns += 1
+                last_turn_acted = False
+                for item in result.get("output", []) or []:
+                    itype = item.get("type")
+                    if itype == "message":
+                        content = item.get("content")
+                        if isinstance(content, str):
+                            texts.append(clean_text(content))
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("text"):
+                                    texts.append(clean_text(part["text"]))
+                    elif itype == "computer_call":
+                        action = item.get("action") or {}
+                        name = action.get("type") or action.get("action") or "?"
+                        detail = {
+                            k: v for k, v in action.items() if k not in ("type", "action")
+                        }
+                        actions.append(f"{name}({json.dumps(detail, default=str)})")
+                        recorder.record("agent_action", action=name, params=detail)
+                        last_turn_acted = True
+                if turns >= max_turns:
+                    truncated = hit_limit = True
+                    log.warning("gui_task hit max_turns=%s", max_turns)
+                    break
+                # A vision turn costs a full multimodal round-trip to vLLM, so a handful
+                # of turns can outlast an MCP client's patience. Stop on our own terms
+                # and hand back partial progress: a timed-out MCP call discards
+                # everything the model learned, while a truncated result can be
+                # continued.
+                if time.monotonic() - started > budget_s:
+                    truncated = hit_limit = True
+                    log.warning(
+                        "gui_task hit budget_s=%s after %s turns", budget_s, turns
+                    )
+                    break
+
+            # cua's loop ends as soon as a turn produces text without an action, so a
+            # model that NARRATES its next step instead of emitting it ("bob is selected,
+            # I'll click Insert") ends the task one click short and reports success.
+            # Observed exactly that: the Insert button was still on screen, unclicked,
+            # while the summary read as if the flow had completed. Nudge it to act.
+            if hit_limit or last_turn_acted or nudges >= MAX_NUDGES:
                 break
-            # A vision turn costs a full multimodal round-trip to vLLM, so a handful of
-            # turns can outlast an MCP client's patience. Stop on our own terms and
-            # hand back partial progress: a timed-out MCP call discards everything the
-            # model learned, while a truncated result can simply be continued.
-            if time.monotonic() - started > budget_s:
-                truncated = True
-                log.warning("gui_task hit budget_s=%s after %s turns", budget_s, turns)
+            if turns >= max_turns or time.monotonic() - started > budget_s:
                 break
+            nudges += 1
+            log.warning("gui_task stalled without acting; nudge %s", nudges)
+            messages = [{"role": "user", "content": task + "\n\n" + NUDGE}]
     except Exception as exc:  # surfaced to opencode rather than hidden
         log.exception("gui_task failed")
-        return {
+        out = {
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
             "turns": turns,
@@ -343,18 +552,66 @@ async def gui_task(
             "summary": "\n".join(t for t in texts[-3:] if t),
             "trajectory": str(traj),
         }
+        # A crashed loop still left the screen in some state, and that state is usually
+        # the thing the caller was trying to find out. Answer anyway.
+        out.update(
+            await _final_report(report, report_region, report_scale, report_effort)
+        )
+        return out
 
-    return {
+    out = {
         "ok": True,
         "turns": turns,
         "truncated": truncated,
         "elapsed_s": round(time.monotonic() - started, 1),
-        "thinking": thinking,
+        "effort": effort,
+        "nudges": nudges,
         "actions": actions,
         "summary": "\n".join(t for t in texts if t) or "(model returned no text)",
         "trajectory": str(traj),
         "session_id": recorder.session_id,
     }
+    if truncated and turns >= max_turns:
+        # Distinguish "ran out of turns mid-task" from "finished". The actions already
+        # happened, so continuing is cheap -- but the caller has to know it must.
+        out["hint"] = (
+            f"stopped at max_turns={max_turns} while still working, NOT because the task "
+            f"was done. The screen is mid-task; call again to continue (the loop sees the "
+            f"current state), or raise max_turns -- budget ~2.5 turns per action."
+        )
+    out.update(await _final_report(report, report_region, report_scale, report_effort))
+    return out
+
+
+async def _final_report(
+    report: Optional[str],
+    region: Optional[List[int]] = None,
+    scale: Optional[float] = None,
+    effort: str = "medium",
+) -> Dict[str, Any]:
+    """Look at the screen once more, independently of whatever the loop believes."""
+    if not report:
+        return {"report_answer": None,
+                "hint": "pass `report` to get an independent look at the final screen "
+                        "instead of trusting the loop's own summary"}
+    try:
+        result = await _ask_screen(report, region, scale, effort=effort)
+    except Exception as exc:
+        return {"report_answer": None,
+                "report_error": f"{type(exc).__name__}: {exc}"}
+    recorder.record("gui_task_report", question=report, region=region,
+                    answer=result.get("answer") or result.get("error"))
+    if not result.get("ok"):
+        return {"report_answer": None, "report_error": result.get("error")}
+    out = {"report_question": report, "report_answer": result["answer"]}
+    if region is None:
+        # The whole-screen answer is the one that silently read the wrong window.
+        out["report_caveat"] = (
+            "answered from the FULL screen: if you asked about specific text, this may "
+            "have been read from the browser chrome or another window. Re-ask with "
+            "report_region (or read_screen) to be sure."
+        )
+    return out
 
 
 # --- 2. precise browser control ---------------------------------------------------
@@ -1198,6 +1455,7 @@ async def read_screen(
     region: Optional[List[int]] = None,
     scale: Optional[float] = None,
     max_tokens: int = 400,
+    effort: str = "medium",
 ) -> Dict[str, Any]:
     """Ask a question about what is on screen and get a TEXT answer back.
 
@@ -1234,66 +1492,32 @@ async def read_screen(
             a 780x70 strip at 4x produced a hallucinated HTML document instead of the
             text, where a squarer crop of the same line read perfectly.
         max_tokens: cap on the answer length.
+        effort: reasoning depth -- 'none', 'low', 'medium' (default) or 'xhigh'. Qwen3.8's
+            template defaults to 'xhigh', so this is set explicitly on every call rather
+            than left alone. Measured on transcribing one document line, all correct on the
+            URL itself:
+
+              none     0.8 s    11 tokens   dropped the line's leading "X "
+              medium   3.0 s    68          full line, correct
+              low      4.6 s   101          full line, correct
+              xhigh    3.4 s    73          full line, plus a hover tooltip from elsewhere
+
+            'medium' is the default because it was both faster and more accurate than
+            'low' here -- the template injects no instruction at 'medium', while 'low'
+            injects "keep your thinking brief", which the model then spends tokens
+            acknowledging. Drop to 'none' for a yes/no glance where a missing leading
+            character cannot change the answer.
 
     Returns:
-        answer, plus the screen size, region and scale, so you can tell what was looked at.
+        answer, plus the screen size, region, scale and effort, so you can tell what was
+        looked at and how hard.
     """
-    computer = await get_computer()
-    shot = await computer.interface.screenshot()
-    raw = base64.b64decode(shot) if isinstance(shot, str) else shot
-
-    try:
-        size = await computer.interface.get_screen_size()
-        screen = f"{size.get('width')}x{size.get('height')}"
-    except Exception:
-        screen = "unknown"
-
-    factor = 1.0 if scale is None else float(scale)
-    raw, _offset, factor = _crop_and_scale(raw, region, factor)
-
-    b64 = base64.b64encode(raw).decode()
-    payload = {
-        "model": MODEL.split("/", 1)[-1],
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        # Reading is a single-shot question; a reasoning block would multiply the latency
-        # for no benefit (measured ~10x on this kind of prompt).
-        "chat_template_kwargs": {"enable_thinking": False},
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
-            {"type": "text", "text":
-                "Answer only from what is visible in this screenshot. If the answer is "
-                "text, transcribe it exactly, including punctuation and spacing. If it "
-                "is not visible, say so plainly.\n\n" + question},
-        ]}],
-    }
-
-    import httpx
-
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(
-                API_BASE.rstrip("/") + "/chat/completions",
-                json=payload, headers={"Authorization": f"Bearer {API_KEY}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}",
-                "hint": "is the model endpoint reachable? see OPENAI_BASE_URL"}
-
-    msg = (data.get("choices") or [{}])[0].get("message") or {}
-    answer = clean_text(msg.get("content") or "") or "(the model returned no text)"
-    recorder.record("read_screen", question=question, region=region, scale=factor)
-    return {
-        "ok": True,
-        "question": question,
-        "answer": answer,
-        "screen": screen,
-        "region": region,
-        "scale": factor,
-        "usage": data.get("usage", {}),
-    }
+    result = await _ask_screen(question, region, scale, max_tokens, effort)
+    recorder.record(
+        "read_screen", question=question, region=region, scale=result.get("scale"),
+        effort=effort,
+    )
+    return result
 
 
 # --- 3b. X-level vision primitives ------------------------------------------------
@@ -1650,6 +1874,10 @@ async def emit_replay_script(session_id: Optional[str]) -> Dict[str, Any]:
             lines.append(f"    # vision step, NOT replayable: {e.get('task','')!r}")
         elif kind == "agent_action":
             lines.append(f"    # vision action: {e.get('action')} {e.get('params')}")
+        elif kind == "gui_task_report":
+            # Not replayable either, but it records what the screen showed, which is the
+            # assertion a hand-written version of this script would want.
+            lines.append(f"    # observed: {e.get('question','')} -> {e.get('answer','')!r}")
 
     lines += [
         "    print('replay finished:', page.url)",

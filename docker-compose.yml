@@ -83,6 +83,25 @@ services:
       - --tensor-parallel-size=1
       - --trust-remote-code
 
+      # Qwen3.8's chat template does `reasoning_effort|default('xhigh')`, so ANY client
+      # that does not set the field gets the most expensive reasoning depth there is --
+      # opencode does not set it, so every agent turn was running at xhigh. Measured on
+      # this stack, same prompt, temperature 0, all answers correct:
+      #
+      #   "name one tool, one line"     xhigh 232.5 s / 4757 tok  ->  low 17.8 s / 408
+      #   "explain a finding, 120 words" xhigh 146.6 s / 3991     ->  low 51.0 s / 1345
+      #   "reason over this code"        xhigh  62.8 s / 1346     ->  low 35.7 s /  876
+      #
+      # 'low' keeps correct tool choice; 'none' does NOT -- asked how to read text off a
+      # canvas it answered browser_eval with a 40-selector querySelectorAll, which is the
+      # one mistake this stack exists to avoid. 'medium' (0.43x) is the conservative
+      # choice if a task ever looks under-reasoned at low.
+      #
+      # The bridge is unaffected either way: gui_task and read_screen send
+      # reasoning_effort explicitly on every request.
+      - --default-chat-template-kwargs
+      - '{"reasoning_effort": "low"}'
+
       # NOTE: deliberately NO --quantization flag; vLLM auto-detects.
       # This checkpoint is compressed-tensors, NOT modelopt like the 3.6 one was:
       # quant_method=compressed-tensors with format="mixed-precision", meaning each

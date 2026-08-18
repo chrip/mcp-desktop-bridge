@@ -71,6 +71,31 @@ turn takes seconds to tens of seconds (measured 7 s to 26 s depending on the mod
 whether the model reasons first), so the vision tool can never finish inside it. See
 [desktop/README.md](desktop/README.md#timeouts--read-this-before-using-gui_task).
 
+### Turn down `reasoning_effort` before you time anything
+
+Qwen3.8's chat template **defaults to `reasoning_effort: xhigh`**, so an MCP client that
+never sets it — opencode included — runs every turn at maximum reasoning depth. Measured on
+this stack, asking the model to name a single tool in one line:
+
+| effort | wall | reasoning | answer |
+|---|---|---|---|
+| `xhigh` (default) | **232.5 s** | 21,184 chars | correct |
+| `low` | **17.8 s** | 1,672 chars | correct |
+
+Deciding which tool to call is most of what an agent loop does, so this is not a corner
+case. Set a server-side default in `docker-compose.yml`:
+
+```yaml
+- --default-chat-template-kwargs
+- '{"reasoning_effort": "low"}'
+```
+
+The bridge's own tools set their effort explicitly and are unaffected — the vision loop
+runs at `none` (aim does not benefit from deliberation) and `read_screen` at `medium`
+(transcription accuracy does). See
+[desktop/README.md](desktop/README.md#reasoning_effort--and-the-xhigh-default-that-costs-you-everything)
+for the full measurements, including why `none` is the wrong choice for the main loop.
+
 Watch the desktop at <http://127.0.0.1:6901> — user **`kasm_user`** (underscore), password
 `VNC_PW`. Then just ask your agent:
 
@@ -83,7 +108,7 @@ Watch the desktop at <http://127.0.0.1:6901> — user **`kasm_user`** (underscor
 
 | Vision (X level — works on anything you can see) | |
 |---|---|
-| `gui_task` | delegated loop: the local model looks at screenshots and drives the mouse until the task is done |
+| `gui_task` | delegated loop: the local model looks at screenshots and drives the mouse until the task is done, then answers a `report` question about the final screen. Hand it a whole block of clicking — driving the same block yourself costs two of your own turns per action |
 | `read_screen` | **ask a question about the screen, get text back.** How you read a canvas: no DOM needed, no image to interpret, no action loop |
 | `screenshot` | screenshot, optionally cropped, zoomed and with a labelled coordinate grid; also reports screen size and the focused window |
 | `click` | click a pixel |

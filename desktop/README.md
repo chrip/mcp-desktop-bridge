@@ -115,9 +115,9 @@ There are two paths, and it matters which one gets used:
 - **`browser_*` — precise.** Real CSS selectors: `browser_goto`, `browser_find`,
   `browser_click`, `browser_fill`, `browser_read`, `browser_scroll`. No pixel guessing,
   so logins and forms are reliable. Prefer these for web work.
-- **`gui_task(task)` — vision.** One delegated call; the model looks at screenshots and
-  drives mouse/keyboard until done. Use for anything that is not a web page (launching
-  apps, dialogs, file manager). Verified: it clicked a dock icon at (566,770) and
+- **`gui_task(task, report=...)` — vision.** One delegated call; the model looks at
+  screenshots and drives mouse/keyboard until done. Use for anything that is not a web page
+  (launching apps, dialogs, file manager). Verified: it clicked a dock icon at (566,770) and
   launched a terminal in 3 turns, and clicked a link on a page correctly.
 
 Nudge opencode toward the precise path for web work, e.g. "use the browser tools, not
@@ -256,7 +256,190 @@ level** while accepting `ctrl+a` — so a selection appears and then nothing is 
 no error. `press_key` now returns a `note` pointing at `browser_press` whenever you send a
 deletion key, because that combination is silent and cost real debugging time.
 
-## `thinking` — the speed/reliability trade-off in gui_task
+## Delegating a block of clicking to `gui_task`
+
+Profiled on a real session: driving a 22-action GUI sequence from opencode took **22
+opencode turns and 342 s**, because every action needs a second turn to look at the result,
+and each of those turns re-decodes opencode's whole context. `gui_task` carries only the
+task text and the last three screenshots, and costs the caller **one** tool result.
+
+Two things had to be added before that delegation was usable, both because of failures
+observed on this exact flow:
+
+**1. Ask for a `report`, with a `report_region`.** The loop's `summary` is its own
+narration, and a loop told to accomplish something narrates success. Measured, same run:
+
+| | said |
+|---|---|
+| `summary` | "bob is selected as a chip and the Insert button appeared. I'll click Insert." |
+| `report_answer` | `EMPTY` |
+
+The document was empty; the dialog was still open with Insert unclicked. `report` takes a
+fresh screenshot and asks a separate single-shot vision call, so it cannot inherit the
+loop's optimism.
+
+The region is not optional in practice. Asked to "transcribe the document line" with no
+region, the answer came back as `https://nextcloud.local/index.php/apps/files/files/540?openfile=true`
+— the **browser address bar**, the most url-shaped text on screen, in the wrong window,
+stated without hesitation. With `report_region: [355, 413, 440, 38]` the same question
+returned `X /pro` and later the inserted link, correctly, for **151 prompt tokens** instead
+of 1075.
+
+**2. Nudges, because cua's loop exits on a text-only turn.** A model that narrates its next
+step instead of emitting it ("I'll click Insert") ends the task one click short and returns
+`truncated: false`, which reads as success. `gui_task` now re-prompts up to
+`CUA_MAX_NUDGES` (3) times: *"you stopped without performing an action — carry it out now,
+do not describe it."* On the run that finally completed the Smart Picker flow, **3 of the 3
+nudges were used**, and the Insert click only happened because of them.
+
+**What you must keep for yourself: deletion.** The loop only has X-level input, and
+deletion keys are silently ignored by this canvas editor (see the `press_key` note above).
+Watched it press ctrl+a, see the selection, press Delete, correctly diagnose "the Delete
+didn't register", re-click and retry — **17 turns and 207 s, never getting past it**,
+because no retry can fix it. Clear text yourself with `browser_press` first, then hand the
+loop a task that only types and clicks.
+
+Measured wall-clock for the same delegated picker flow, three runs:
+
+| run | turns | s/turn | wall | outcome |
+|---|---|---|---|---|
+| `thinking=True`, no nudges yet | 15 | 3.9 | 58 s | stalled one click before Insert, reported success |
+| `thinking=True`, 3 nudges | 36 | 16.6 | **598 s** | completed — link inserted, trigger text gone |
+| `thinking=False`, 3 nudges | 22 | 3.7 | **81 s** | completed — same correct result |
+
+Both completing runs ended with the document reading
+`X http://nextcloud.local/index.php/u/bob`, confirmed by cropped screenshot: the link
+inserted and the `/pro` trigger text removed.
+
+**`thinking=False` was 7.4× faster and just as correct.** That reverses the earlier
+recommendation on this page: thinking used to be what rescued multi-step tasks, because
+without it the loop stalled. Nudges rescue the stall directly and much more cheaply, so the
+reasoning block is no longer buying reliability on action sequences — it is only buying
+narration, and narration is what stalls the loop in the first place. `thinking=False` stays
+the default. Reach for `thinking=True` only when a step needs real judgement about *what*
+to do, not about where to click.
+
+One residual imprecision worth knowing: on the verified line above, `report_answer` came
+back as `http://nextcloud.local/index.php/u/bob` — it dropped the leading `X `. The region
+included it. If a leading character matters to your assertion, say so in the question
+("include the first character of the line") or crop a little wider and check yourself.
+
+## `reasoning_effort` — and the xhigh default that costs you everything
+
+Qwen3.8 replaced Qwen3's `enable_thinking` boolean with a four-level `reasoning_effort`,
+and **its chat template defaults to `xhigh`** — the most expensive setting there is:
+
+```jinja
+{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+```
+
+So a client that says nothing gets maximum reasoning depth on every turn, including turns
+that only decide where to click. Verify it on your own template:
+
+```bash
+grep -n "reasoning_effort\|enable_thinking" \
+  ~/hf-cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/*/chat_template.jinja
+```
+
+Both paths reach it: top-level `reasoning_effort` (the OpenAI field) and
+`chat_template_kwargs: {"reasoning_effort": …}`. Proof that it reaches jinja rather than
+being swallowed — send a bad value and the template's own exception comes back:
+
+```
+{"error":{"message":"Unexpected reasoning effort bogus. Supported types are
+ xhigh (default), medium, and low.", "code":400}}
+```
+
+Four usable levels, and two traps:
+
+| value | effect |
+|---|---|
+| `none` | identical to the old `enable_thinking: false` — verified, same token counts |
+| `low` | injects *"keep your thinking brief and focused"* |
+| `medium` | injects **nothing at all** — the model's natural behaviour |
+| `xhigh` | injects *"think carefully, validate key assumptions, consider plausible alternatives"* |
+| `high` | accepted, aliased to `xhigh` by the template |
+| `max`, `minimal` | **accepted by vLLM's API layer, then rejected by the template with HTTP 400.** `gui_task`/`read_screen` reject these up front with an explanation instead |
+
+Note that `medium` is not "half of xhigh" — it is the *absence* of an instruction, while
+`low` is an instruction to be brief. That is why `low` sometimes costs more than `medium`:
+the model spends tokens acknowledging the instruction.
+
+### On a code-reasoning question (one prompt, temperature 0, all answers correct)
+
+| effort | output tokens | wall |
+|---|---|---|
+| `xhigh` (= the default) | 1396 | 60–66 s |
+| `medium` | 885 | 38.4 s |
+| `low` | 620 | 24.7 s |
+| `none` | 61 | **2.9 s** |
+
+`default (nothing set)`, `xhigh` and `high` all produced **exactly 1396 tokens** — which is
+the cleanest possible proof that an unconfigured request really is running at xhigh.
+
+### On three prompt types that mirror a profiled real session
+
+Temperature 0, one run each, `reasoning` field measured separately from the answer:
+
+| prompt type | `xhigh` (default) | `medium` | `low` | `none` |
+|---|---|---|---|---|
+| code analysis, 1-sentence answer | 62.8 s / 1346 tok | 42.1 s / 967 | 35.7 s / 876 | 2.5 s / 55 |
+| write up a finding in ~120 words | 146.6 s / 3991 tok | 115.5 s / 3204 | 51.0 s / 1345 | 11.3 s / 240 |
+| **pick one tool, answer in one line** | **232.5 s / 4757 tok** | 32.0 s / 763 | **17.8 s / 408** | 33.2 s / 695 |
+| **total** | **441.9 s** | 189.6 s (0.43x) | **104.5 s (0.24x)** | 47.0 s (0.11x) |
+
+The third row is the one that matters, because deciding which tool to call next is what an
+agent loop does all day. At the default it spent **21,184 characters of reasoning and 232
+seconds** to answer "name one tool" — 13x what `low` needed for the same correct answer.
+That is the article's "wildly overthinking" complaint showing up as agent wall-clock.
+
+**But `none` is not the floor to aim for.** Asked which tool reads text off a *canvas*,
+`xhigh`, `medium` and `low` all answered `read_screen`. `none` answered:
+
+```js
+browser_eval("document.querySelectorAll('iframe')[0].contentDocument
+              .querySelectorAll('iframe')[0].contentDocument
+              .querySelector('p, div, span, h1, h2, …40 more selectors…')")
+```
+
+DOM introspection on a canvas — the precise mistake this whole project exists to avoid.
+Reasoning is what buys correct tool *choice*; `low` buys it for 8% of xhigh's time.
+
+### In the gui_task action loop — the opposite of what you would guess
+
+Same 9-action Smart Picker flow each time:
+
+| effort | turns | s/turn | wall | outcome |
+|---|---|---|---|---|
+| `none` | 22 | **3.7** | **81 s** | completed correctly |
+| `low` | 40 (hit cap) | 8.3 | 331 s | **failed** — stray `/`, backspaces, three clicks at the window edge |
+| `xhigh` | 36 | 16.6 | 598 s | completed correctly |
+
+`low` was both slower *and* worse than `none`. More reasoning about a click is not better
+aim; it is more opportunity to talk itself into a different pixel. `effort='none'` is the
+default for the loop for this reason.
+
+### In read_screen — where `none` is NOT safe
+
+Transcribing one document line, two separate runs:
+
+| effort | wall | outcome |
+|---|---|---|
+| `none` | 0.6–0.8 s | dropped the line's leading `X ` in one run, answered `Warning` (stale dialog) in another |
+| `low` | 4.5–5.7 s | correct once, `"No text is visible in this screenshot."` once |
+| `medium` | 3.0–5.3 s | **correct in both runs** |
+| `xhigh` | 2.5–3.4 s | correct, but once burned all 400 `max_tokens` on reasoning and returned **no answer at all** |
+
+So the loop and the reader want opposite settings, which is why `gui_task` has both
+`effort` (default `none`) and `report_effort` (default `medium`). `read_screen` defaults to
+`medium` too. Drop to `none` only for a yes/no glance where a missing character cannot
+change the answer.
+
+## `thinking` — historical note (Qwen3.6-era `enable_thinking`)
+
+The section below was measured against `enable_thinking`, which `reasoning_effort: none`
+now supersedes exactly. It is kept because the reliability argument in it is what motivated
+nudges.
 
 `gui_task(task, thinking=False)` controls whether the model emits a reasoning block
 before acting. It reaches vLLM as `chat_template_kwargs: {enable_thinking: …}`.
