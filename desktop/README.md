@@ -338,7 +338,7 @@ that only decide where to click. Verify it on your own template:
 
 ```bash
 grep -n "reasoning_effort\|enable_thinking" \
-  ~/hf-cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/*/chat_template.jinja
+  ~/hf-cache/huggingface/hub/models--nvidia--Qwen3.8-27B-NVFP4/snapshots/*/chat_template.jinja
 ```
 
 Both paths reach it: top-level `reasoning_effort` (the OpenAI field) and

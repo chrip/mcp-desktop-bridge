@@ -41,7 +41,7 @@ a real timing bug in an office suite's Smart Picker, which is documented in
   repin the base image.
 - **Docker** with Compose v2+ and the NVIDIA container runtime (for the vLLM service).
 - **A vision-capable model** served over an OpenAI-compatible API. The bundled compose
-  file runs `unsloth/Qwen3.8-27B-NVFP4` in vLLM; anything that accepts images works.
+  file runs `nvidia/Qwen3.8-27B-NVFP4` in vLLM; anything that accepts images works.
 - **An MCP client.** Developed against [opencode](https://opencode.ai); any MCP client
   that speaks streamable HTTP will do.
 - Roughly **30 GB** disk: ~22 GB model weights, ~5 GB desktop image.
