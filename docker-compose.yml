@@ -1,8 +1,13 @@
 # docker-compose.yml
-# vLLM serving for unsloth/Qwen3.8-27B-NVFP4 on DGX Spark
+# vLLM serving for nvidia/Qwen3.8-27B-NVFP4 on DGX Spark
 # (GB10, aarch64, 121 GiB unified memory).
 #
-# Swapped from nvidia/Qwen3.6-27B-NVFP4. Same architecture
+# Swapped from unsloth/Qwen3.8-27B-NVFP4 on 2026-10-21: same base model, NVIDIA's
+# ModelOpt quantization decoded ~24% faster in the community NVFP4 shootout
+# (huggingface.co/Qwen/Qwen3.8-27B/discussions/192: 38.6 vs 31.2 tok/s, MBPP 70.4
+# vs 68.9), and unsloth's build was reported to emit gibberish in rare cases.
+#
+# Originally swapped from nvidia/Qwen3.6-27B-NVFP4. Same architecture
 # (Qwen3_5ForConditionalGeneration, 64 layers: 16 full-attention + 48 linear,
 # 4 KV heads x 256 head_dim, 262144 context), so every tuning flag below still
 # applies and the desktop bridge needs no change at all -- see the
@@ -14,11 +19,8 @@
 # was doing; FP8 would cost roughly 30-40% per turn for no benefit here, since
 # its advantage would land in prefill, which is only ~1.6 s of a ~26 s turn.
 #
-# FIRST START DOWNLOADS ~21.8 GiB from HuggingFace. Expect a long first boot.
-# It lands in the bind-mounted host cache below and persists.
-#
-# The 3.6 weights (20.4 GiB) stay in that same cache, so reverting is a two-line
-# change to the model arg and served name, with no re-download.
+# The weights (20.4 GiB, revision 482ca0f) are already in the bind-mounted host
+# cache below; on a fresh box the first start downloads them. Expect a long first boot.
 #
 # Start:      docker compose up -d
 # vLLM logs:  docker compose logs -f vllm
@@ -26,11 +28,15 @@
 
 services:
   vllm:
-    # Pinned by digest to the exact arm64 image this box already runs:
-    # vLLM 0.23.0 / torch 2.11.0+cu130. ':latest' floats and would eventually
-    # change under you, taking the CUDA build with it.
-    image: vllm/vllm-openai@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f
-    container_name: qwen-3.6-27b-spark
+    # Pinned by digest: vLLM 0.30.0 / torch 2.13.0+cu130 / flashinfer 0.6.18.post1
+    # (2026-10-01). ':latest' floats and would eventually change under you, taking
+    # the CUDA build with it. This build ships sm_120 cubins and no PTX; sm_120 code
+    # runs on the GB10's sm_121 (same major, higher minor).
+    # Rollback: vLLM 0.23.0 / torch 2.11.0+cu130, ran here 2026-06 to 2026-10-01
+    # (local image removed 2026-10-01; pulling the digest takes ~1 h over WiFi):
+    #   vllm/vllm-openai@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f
+    image: vllm/vllm-openai@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90
+    container_name: qwen-3.8-27b-spark
     restart: unless-stopped
     ipc: host
 
@@ -61,7 +67,7 @@ services:
               capabilities: [gpu]
 
     command:
-      - unsloth/Qwen3.8-27B-NVFP4
+      - nvidia/Qwen3.8-27B-NVFP4
       # TWO names for the same weights, and the second one is load-bearing.
       # cua's agent loop for this architecture registers itself as
       #   @register_agent(models=r"(?i).*qwen35.*", priority=1)
@@ -78,6 +84,10 @@ services:
       - --served-model-name
       - qwen3.8-27b
       - qwen35-27b
+      # OSWorld 2.0 requires a model alias its config recognises; it rejects
+      # arbitrary names. This is the same weights under a third label -- nothing
+      # about the served model changes, only what a client may ask for.
+      - gpt-local
       - --host=0.0.0.0
       - --port=8000
       - --tensor-parallel-size=1
@@ -103,18 +113,15 @@ services:
       - '{"reasoning_effort": "low"}'
 
       # NOTE: deliberately NO --quantization flag; vLLM auto-detects.
-      # This checkpoint is compressed-tensors, NOT modelopt like the 3.6 one was:
-      # quant_method=compressed-tensors with format="mixed-precision", meaning each
-      # config group carries its own format. Verified supported by this image:
-      # compressed_tensors 0.17.0 lists both "mixed-precision" and
-      # "nvfp4-pack-quantized" in CompressionFormat, and vLLM applies quant_format
-      # per group (CompressedTensorsW4A4Fp4 is present).
-      # Layout: MLPs are W4A4 NVFP4 (group_size 16) except the last 8 layers;
-      # attention projections, lm_head and those last-8 MLPs are FP8; the vision
-      # tower is in the ignore list, so it stays unquantized.
-      # Note W4A4 is more aggressive than the 3.6 build's W4A16 -- 4-bit
-      # activations too. If GUI grounding accuracy ever looks worse, that is the
-      # first thing to suspect, and Qwen/Qwen3.8-27B-FP8 is the conservative swap.
+      # This checkpoint is modelopt (0.47) with quant_algo=MIXED_PRECISION: a per-layer
+      # algo list in hf_quant_config.json. Verified supported by this image:
+      # vLLM 0.30's modelopt.py has ModelOptMixedPrecisionConfig.
+      # Layout: all 64 MLPs NVFP4 (gate/up/down), lm_head NVFP4; every attention
+      # projection FP8 (48 linear_attn + 16 self_attn layers). The MTP head is in
+      # exclude_modules and the vision tower is not listed, so both stay unquantized
+      # -- MTP speculative decoding below needs that head.
+      # If GUI grounding accuracy ever looks worse, the NVFP4 MLPs are the first
+      # thing to suspect, and Qwen/Qwen3.8-27B-FP8 is the conservative swap.
 
       # max_position_embeddings is 262144 in this checkpoint too.
       - --max-model-len=262144
@@ -163,6 +170,17 @@ services:
       # non-Eagle method would hard-fail rather than silently disable).
       - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
       - --async-scheduling
+
+      # Triton instead of the automatic FlashInfer for the 16 full-attention layers.
+      # FlashInfer + MTP crashed this box three times with an illegal memory access
+      # (kernel: NVRM Xid 31 MMU fault) -- 2026-09-30 01:07 and 05:14, 2026-10-01
+      # 09:01, each with 8 decodes running, the first in FlashInfer's
+      # _build_attention_metadata -- and hung the engine silently on 2026-10-01
+      # 11:50. Known upstream and still open: vllm#37754 "FlashInfer + MTP crashes
+      # on SM121"; suspected cause is sm_121's 99 KB shared memory vs 228 KB on
+      # data-centre Blackwell. Its workaround is this flag. Throughput before the
+      # switch: ~152 tok/s generation at 8 concurrent requests.
+      - --attention-backend=TRITON_ATTN
 
       # Qwen3.8 is a thinking model; without this its <think> blocks arrive
       # inside `content` instead of `reasoning_content` and leak into every
