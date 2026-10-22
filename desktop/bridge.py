@@ -100,6 +100,24 @@ _PW_KEYS = {"backspace": "Backspace", "return": "Enter", "enter": "Enter",
 _DELETE_KEYS = {"backspace", "delete", "del"}
 
 
+_MODIFIER_NAMES = {"ctrl", "control", "shift", "alt", "meta", "super", "cmd"}
+
+
+def _modifier_keys(mods: Optional[List[str]], table: Dict[str, str]) -> List[str]:
+    """Validate click modifiers and spell them for X (`_X_KEYS`) or Playwright."""
+    out: List[str] = []
+    for mod in mods or []:
+        low = mod.strip().lower()
+        if low not in _MODIFIER_NAMES:
+            raise ValueError(f"unknown modifier {mod!r}; use ctrl, shift, alt or super")
+        if table is _PW_KEYS:
+            out.append({"ctrl": "Control", "control": "Control",
+                        "shift": "Shift", "alt": "Alt"}.get(low, "Meta"))
+        else:
+            out.append({"control": "ctrl", "meta": "super", "cmd": "super"}.get(low, low))
+    return out
+
+
 def _norm_key(key: str, table: Dict[str, str]) -> str:
     """Translate one key or chord into the spelling the target expects."""
     parts = [p.strip() for p in key.split("+") if p.strip()]
@@ -937,6 +955,7 @@ async def browser_click(
     wait_for_nav: bool = False,
     frame: Optional[str] = None,
     timeout_ms: int = 12000,
+    modifiers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Click the element matching a CSS selector.
 
@@ -949,16 +968,22 @@ async def browser_click(
             a login form), so the call returns only once the new page has loaded.
         frame: CSS selector of an iframe to look inside, from browser_frames.
         timeout_ms: how long to wait for the element before giving up.
+        modifiers: keys held during the click, e.g. ["ctrl"]. Any of ctrl, shift,
+            alt, meta.
     """
     page = await get_page()
     sel = _inner(selector, frame)
     target = _scope(page, frame).locator(sel)
     try:
+        held = _modifier_keys(modifiers, _PW_KEYS)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
         if wait_for_nav:
             async with page.expect_navigation():
-                await target.click(timeout=timeout_ms)
+                await target.click(timeout=timeout_ms, modifiers=held or None)
         else:
-            await target.click(timeout=timeout_ms)
+            await target.click(timeout=timeout_ms, modifiers=held or None)
     except Exception as exc:
         # Return a usable failure instead of a raw stack: a timed-out click usually
         # means the selector is wrong, so say what to try next.
@@ -971,8 +996,11 @@ async def browser_click(
                     "browser_frames if the element is inside an iframe",
         }
     recorder.record("browser_click", selector=sel, wait_for_nav=wait_for_nav,
-                    frame=frame)
-    return {"ok": True, "selector": sel, "frame": frame, "url": page.url}
+                    frame=frame, modifiers=held)
+    out = {"ok": True, "selector": sel, "frame": frame, "url": page.url}
+    if held:
+        out["modifiers"] = held
+    return out
 
 
 @mcp.tool
@@ -1537,6 +1565,7 @@ async def click(
     y: Optional[Union[int, str]] = None,
     button: str = "left",
     double: bool = False,
+    modifiers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Click at absolute screen pixel coordinates, bypassing the DOM entirely.
 
@@ -1548,6 +1577,8 @@ async def click(
         y: pixel y in the screenshot, 0-799.
         button: "left" or "right".
         double: double-click instead of single.
+        modifiers: keys held during the click, e.g. ["ctrl"] to follow a link in an
+            editor, ["shift"] to extend a selection. Any of ctrl, shift, alt, super.
     """
     try:
         x, y = _xy(x, y)
@@ -1576,14 +1607,32 @@ async def click(
                     "is resized by whoever is watching, so older coordinates go stale",
         }
 
-    if double:
-        await iface.double_click(x, y)
-    elif button == "right":
-        await iface.right_click(x, y)
-    else:
-        await iface.left_click(x, y)
-    recorder.record("desktop_click", x=x, y=y, button=button, double=double)
-    return {"ok": True, "x": x, "y": y, "button": button, "double": double}
+    try:
+        held = _modifier_keys(modifiers, _X_KEYS)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    # Without this an agent could not Ctrl+click a link in a canvas editor and tried to
+    # install xdotool into the container instead (2026-10-21).
+    pressed: List[str] = []
+    try:
+        for key in held:
+            await iface.key_down(key)
+            pressed.append(key)
+        if double:
+            await iface.double_click(x, y)
+        elif button == "right":
+            await iface.right_click(x, y)
+        else:
+            await iface.left_click(x, y)
+    finally:
+        for key in reversed(pressed):
+            await iface.key_up(key)
+    recorder.record("desktop_click", x=x, y=y, button=button, double=double,
+                    modifiers=held)
+    out: Dict[str, Any] = {"ok": True, "x": x, "y": y, "button": button, "double": double}
+    if held:
+        out["modifiers"] = held
+    return out
 
 
 @mcp.tool
@@ -1635,24 +1684,113 @@ async def press_key(key: str, times: int = 1) -> Dict[str, Any]:
     return result
 
 
+# Pause between wheel clicks. Sent as one burst (~50 ms for 40 clicks), the browser
+# coalesces most of them: 40 clicks moved an office editor only 90-900 px instead of
+# ~1800, and an agent read that as the app lagging -- a false bug report (2026-10-21).
+# One click every 0.5 s registered 45 px each, every time, on every document tested.
+_SCROLL_GAP_S = 0.1
+
+
 @mcp.tool
 async def scroll_screen(clicks: int, down: bool = True) -> Dict[str, Any]:
     """Scroll the X display with the mouse wheel, wherever the pointer is.
 
-    Move the pointer first with desktop_click if the wrong pane scrolls.
+    Move the pointer first with desktop_click if the wrong pane scrolls. Clicks are sent
+    one at a time with a short pause, so N clicks really scroll N steps; a large N takes
+    N x 0.1 s.
     """
     computer = await get_computer()
     iface = computer.interface
-    if down:
-        await iface.scroll_down(clicks=clicks)
-    else:
-        await iface.scroll_up(clicks=clicks)
-    recorder.record("desktop_scroll", clicks=clicks, down=down)
-    return {"ok": True, "clicks": clicks, "down": down}
+    step = iface.scroll_down if down else iface.scroll_up
+    n = max(1, clicks)
+    for i in range(n):
+        await step(clicks=1)
+        if i + 1 < n:
+            await asyncio.sleep(_SCROLL_GAP_S)
+    recorder.record("desktop_scroll", clicks=n, down=down)
+    return {"ok": True, "clicks": n, "down": down}
+
+
+_EVAL_STATEMENT_START = re.compile(
+    r"(const|let|var|if|for|while|do|switch|try|throw|class|return)\b")
+
+
+def _eval_wants_body(expr: str) -> bool:
+    """True when `expr` is a statement body rather than an expression.
+
+    Decided by `return` or `;` at bracket depth 0, or a leading statement keyword --
+    NOT by the word "return" anywhere. That old rule misfired on every IIFE such as
+    `(() => { ...; return x })()`: wrapped as a body, it ran as a statement and came
+    back null (23 of 25 IIFE calls across four agent runs, 2026-10). Strings, template
+    literals and comments are skipped; regex literals are not, which is rare enough.
+    """
+    if _EVAL_STATEMENT_START.match(expr):
+        return True
+    depth, i, n = 0, 0, len(expr)
+    while i < n:
+        c = expr[i]
+        if c in "'\"`":
+            j = i + 1
+            while j < n and expr[j] != c:
+                j += 2 if expr[j] == "\\" else 1
+            i = j + 1
+            continue
+        if expr.startswith("//", i):
+            nl = expr.find("\n", i)
+            i = n if nl < 0 else nl
+            continue
+        if expr.startswith("/*", i):
+            end = expr.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0:
+            if c == ";" and expr[i + 1:].strip():
+                return True
+            if (expr.startswith("return", i)
+                    and (i == 0 or not (expr[i - 1].isalnum() or expr[i - 1] in "_$"))
+                    and not expr[i + 6:i + 7].isalnum()):
+                return True
+        i += 1
+    return False
+
+
+# Serialise inside the page, with limits. Letting Playwright serialise the raw value
+# walks the whole object graph: returning an editor's logic document did that for
+# minutes, allocated ~600 MB/s and was mistaken for the very OOM under investigation
+# (2026-10-22). It also failed outright on cycles ("cyclic object value").
+_EVAL_NODE_CAP = 5000
+_EVAL_CHAR_CAP = 200_000
+_EVAL_JS = """async () => {
+  const v = await (__CANDIDATE__)();
+  if (v === undefined) return {undef: true};
+  const seen = new WeakSet();
+  let nodes = 0, capped = false, s;
+  try {
+    s = JSON.stringify(v, function (k, x) {
+      if (++nodes > __NODES__) { capped = true; return undefined; }
+      if (typeof x === 'function') return '[function ' + (x.name || 'anonymous') + ']';
+      if (typeof x === 'bigint') return x.toString();
+      if (x && typeof x === 'object') {
+        if (typeof Node !== 'undefined' && x instanceof Node) return '[' + x.nodeName + ']';
+        if (seen.has(x)) return '[repeated or cyclic reference]';
+        seen.add(x);
+      }
+      return x;
+    });
+  } catch (e) { s = JSON.stringify(String(v)); }
+  if (s === undefined) s = JSON.stringify(String(v));
+  const truncated = s.length > __CHARS__;
+  return {json: truncated ? s.slice(0, __CHARS__) : s, truncated, capped};
+}"""
 
 
 @mcp.tool
-async def browser_eval(expression: str, frame: Optional[str] = None) -> Dict[str, Any]:
+async def browser_eval(expression: str, frame: Optional[str] = None,
+                       timeout_ms: int = 30000) -> Dict[str, Any]:
     """Evaluate JavaScript in the page (or inside an iframe) and return the result.
 
     The tool that turns "the GUI misbehaves" into "here is the state that explains it".
@@ -1661,13 +1799,18 @@ async def browser_eval(expression: str, frame: Optional[str] = None) -> Dict[str
     without rebuilding anything.
 
     Args:
-        expression: a JS expression ("document.title", "window.Common?.Utils") or a
-            statement body ending in `return`. Both forms are accepted.
+        expression: a JS expression ("document.title", "window.Common?.Utils", an IIFE
+            like "(() => { ...; return x })()") or a statement body with a top-level
+            `return`. Both forms are accepted; promises are awaited.
         frame: iframe chain from browser_frames, e.g. "#euroofficeFrame >>> iframe".
             Needed to reach code inside an embedded editor.
+        timeout_ms: give up after this long. A page whose main thread is busy never
+            answers; without a limit the call would hang until the client times out.
 
     Returns:
-        the value, JSON-serialised. Values JS cannot serialise come back as a string.
+        the value, JSON-serialised in the page: functions, DOM nodes and repeated or
+        cyclic references come back as placeholder strings, and large values are capped
+        (`capped` / `truncated` say so). Return a small projection, not a whole object.
     """
     page = await get_page()
     try:
@@ -1675,23 +1818,42 @@ async def browser_eval(expression: str, frame: Optional[str] = None) -> Dict[str
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
 
-    expr = expression.strip()
-    # Accept both an expression and a body: wrapping an expression in a function is what
-    # Playwright wants, but a caller who writes "return x" should not get a syntax error.
-    candidates = ([f"() => {{ {expr} }}"] if "return" in expr
-                  else [f"() => ({expr})", f"() => {{ {expr} }}"])
-    last: Optional[str] = None
+    raw = expression.strip()
+    body = _eval_wants_body(raw)
+    expr = raw if body else raw.rstrip(";").rstrip()
+    as_expr, as_body = f"() => ({expr})", f"() => {{ {expr} }}"
+    # The detected form first; the other only if the first throws, so a misdetection
+    # costs one retry instead of a wrong answer.
+    candidates = [as_body, as_expr] if body else [as_expr, as_body]
+    first_error: Optional[str] = None
     for candidate in candidates:
+        js = (_EVAL_JS.replace("__CANDIDATE__", candidate)
+              .replace("__NODES__", str(_EVAL_NODE_CAP))
+              .replace("__CHARS__", str(_EVAL_CHAR_CAP)))
         try:
-            value = await target.evaluate(candidate)
-            try:
-                json.dumps(value)
-            except (TypeError, ValueError):
-                value = repr(value)
-            return {"ok": True, "frame": frame, "value": value}
+            r = await asyncio.wait_for(target.evaluate(js), timeout=timeout_ms / 1000)
+        except asyncio.TimeoutError:
+            return {"ok": False, "frame": frame,
+                    "error": f"no answer within {timeout_ms} ms",
+                    "hint": "the page's main thread is busy or the expression does not "
+                            "finish; check browser_console, or reload the page"}
         except Exception as exc:
-            last = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
-    return {"ok": False, "error": last, "frame": frame}
+            first_error = first_error or f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+            continue
+        if r.get("undef"):
+            return {"ok": True, "frame": frame, "value": None,
+                    "note": "the expression evaluated to undefined"}
+        out: Dict[str, Any] = {"ok": True, "frame": frame}
+        if r.get("truncated"):
+            out["value"] = r["json"]
+            out["truncated"] = True
+        else:
+            out["value"] = json.loads(r["json"])
+        if r.get("capped"):
+            out["capped"] = (f"stopped after {_EVAL_NODE_CAP} values; return a smaller "
+                             "projection of the object")
+        return out
+    return {"ok": False, "error": first_error, "frame": frame}
 
 
 @mcp.tool
@@ -1844,13 +2006,14 @@ async def emit_replay_script(session_id: Optional[str]) -> Dict[str, Any]:
                 lines.append(f"    {_target_expr(e)}.fill({e['text']!r})")
             replayable += 1
         elif kind == "browser_click":
+            mods = f"modifiers={e['modifiers']!r}" if e.get("modifiers") else ""
             if e.get("wait_for_nav"):
                 lines += [
                     "    with page.expect_navigation():",
-                    f"        {_target_expr(e)}.click()",
+                    f"        {_target_expr(e)}.click({mods})",
                 ]
             else:
-                lines.append(f"    {_target_expr(e)}.click()")
+                lines.append(f"    {_target_expr(e)}.click({mods})")
             replayable += 1
         elif kind == "browser_scroll":
             lines.append(f"    page.mouse.wheel({e.get('dx',0)}, {e.get('dy',0)})")

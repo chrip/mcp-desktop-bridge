@@ -111,10 +111,10 @@ Watch the desktop at <http://127.0.0.1:6901> — user **`kasm_user`** (underscor
 | `gui_task` | delegated loop: the local model looks at screenshots and drives the mouse until the task is done, then answers a `report` question about the final screen. Hand it a whole block of clicking — driving the same block yourself costs two of your own turns per action |
 | `read_screen` | **ask a question about the screen, get text back.** How you read a canvas: no DOM needed, no image to interpret, no action loop |
 | `screenshot` | screenshot, optionally cropped, zoomed and with a labelled coordinate grid; also reports screen size and the focused window |
-| `click` | click a pixel |
+| `click` | click a pixel, optionally holding modifiers (`["ctrl"]` to follow a link in an editor) |
 | `type_text` | type into whatever has focus |
 | `press_key` | key or chord |
-| `scroll_screen` | wheel scroll |
+| `scroll_screen` | wheel scroll, one click at a time so the app registers every step |
 | `focus_browser` | put keyboard focus back on the browser |
 
 | Selectors (precise — for DOM, across frames) | |

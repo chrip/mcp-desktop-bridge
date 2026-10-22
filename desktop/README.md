@@ -195,7 +195,12 @@ building anything**: set the value at runtime, re-run the failing flow, and see 
 symptom disappears. Verified doing exactly that — far better than patching a served bundle
 and having to restore it. A reload discards the override, so there is nothing to undo.
 
-Accepts an expression (`document.title`) or a body (`return x`).
+Accepts an expression (`document.title`, an IIFE like `(() => { …; return x })()`) or a
+body with a top-level `return` (`const a = …; return a`); promises are awaited. The value
+is serialised inside the page with limits — functions, DOM nodes and cyclic references
+become placeholder strings, and large values are capped — so return a small projection,
+not a whole application object. `timeout_ms` (default 30 s) stops a call on a page whose
+main thread is busy instead of hanging.
 
 **`browser_console(limit, level)`** — rolling buffer of console output and uncaught page
 errors, collected from browser start, so messages logged before you asked are still there.
