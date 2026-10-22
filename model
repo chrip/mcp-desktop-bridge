@@ -1,0 +1,94 @@
+#!/bin/bash
+# Switch the model the desktop's agents use. One big model fits the 121 GiB pool at a
+# time, so switching stops the other one first.
+#
+#   ./model status          which model is up, its endpoint, free memory
+#   ./model use 27b         nvidia/Qwen3.8-27B-NVFP4 in the compose `vllm` service, :8000
+#   ./model use flash       nvidia/Qwen3.8-Flash-Next-NVFP4 via flash/serve-flash.sh, :18300
+#
+# `use` writes COMPOSE_PROFILES, MODEL_BASE_URL and CUA_MODEL_NAME into .env, so a plain
+# `docker compose up -d` afterwards brings back the same setup.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+VLLM_CONTAINER=qwen-3.8-27b-spark
+FLASH_CONTAINER=qwen38-flash
+DESKTOP_CONTAINER=qwen-gui-desktop
+
+set_env() {  # KEY VALUE -- replace or append one line in .env
+    if grep -q "^$1=" .env; then sed -i "s|^$1=.*|$1=$2|" .env; else echo "$1=$2" >> .env; fi
+}
+
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+
+wait_api() {  # PORT MODEL_ID -- until the model is listed, or give up after 25 min
+    local start; start=$(date +%s)
+    echo ">> waiting for $2 on :$1 (first boot can take 10+ minutes)"
+    until curl -sf -m 3 "http://127.0.0.1:$1/v1/models" | grep -q "\"$2\""; do
+        if [ $(( $(date +%s) - start )) -gt 1500 ]; then
+            echo "!! $2 is not answering after 25 min -- check: docker logs $3" >&2
+            exit 1
+        fi
+        sleep 10
+    done
+    echo ">> $2 is up after $(( $(date +%s) - start )) s"
+}
+
+# The desktop keeps its container name across checkouts; one started from another
+# compose project (e.g. an older fork) would block `up`. Its state lives in a volume.
+adopt_desktop() {
+    local project
+    project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' \
+        "$DESKTOP_CONTAINER" 2>/dev/null || true)
+    if [ -n "$project" ] && [ "$project" != "$(basename "$PWD")" ]; then
+        echo ">> removing $DESKTOP_CONTAINER from compose project '$project'"
+        docker rm -f "$DESKTOP_CONTAINER" >/dev/null
+    fi
+}
+
+status() {
+    local m="none"
+    running "$VLLM_CONTAINER" && m="27b ($VLLM_CONTAINER, :8000)"
+    running "$FLASH_CONTAINER" && m="flash ($FLASH_CONTAINER, :18300)"
+    echo "model:    $m"
+    echo "profile:  $(grep -E '^COMPOSE_PROFILES=' .env | cut -d= -f2- || echo '(unset, 27b defaults)')"
+    echo "desktop:  $(docker inspect -f '{{.State.Status}} -> {{range .Config.Env}}{{if eq (index (split . "=") 0) "OPENAI_BASE_URL"}}{{.}}{{end}}{{end}}' "$DESKTOP_CONTAINER" 2>/dev/null || echo 'not created')"
+    echo "memory:   $(awk '/MemAvailable/{printf "%.1f GiB available", $2/1048576}' /proc/meminfo)"
+}
+
+case "${1:-status}" in
+    status) status ;;
+    use)
+        case "${2:-}" in
+            27b)
+                if running "$FLASH_CONTAINER"; then echo ">> stopping $FLASH_CONTAINER"; docker stop "$FLASH_CONTAINER" >/dev/null; fi
+                set_env COMPOSE_PROFILES 27b
+                set_env MODEL_BASE_URL http://host.docker.internal:8000/v1
+                set_env CUA_MODEL_NAME openai/qwen35-27b
+                adopt_desktop
+                docker compose up -d vllm
+                wait_api 8000 qwen3.8-27b "$VLLM_CONTAINER"
+                docker compose up -d desktop
+                ;;
+            flash)
+                if running "$VLLM_CONTAINER"; then echo ">> stopping $VLLM_CONTAINER"; docker stop "$VLLM_CONTAINER" >/dev/null; fi
+                set_env COMPOSE_PROFILES flash
+                set_env MODEL_BASE_URL http://host.docker.internal:18300/v1
+                set_env CUA_MODEL_NAME openai/qwen35-flash-next
+                if running "$FLASH_CONTAINER"; then
+                    echo ">> $FLASH_CONTAINER already running"
+                elif docker inspect "$FLASH_CONTAINER" >/dev/null 2>&1; then
+                    docker start "$FLASH_CONTAINER" >/dev/null   # same parameters, ~3 min
+                else
+                    flash/serve-flash.sh
+                fi
+                wait_api 18300 qwen35-flash-next "$FLASH_CONTAINER"
+                adopt_desktop
+                docker compose up -d desktop
+                ;;
+            *) echo "usage: $0 use 27b|flash" >&2; exit 2 ;;
+        esac
+        status
+        ;;
+    *) echo "usage: $0 status | use 27b|flash" >&2; exit 2 ;;
+esac

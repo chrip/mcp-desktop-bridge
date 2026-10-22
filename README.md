@@ -51,8 +51,24 @@ a real timing bug in an office suite's Smart Picker, which is documented in
 ```bash
 git clone <this repo> && cd mcp-desktop-bridge
 cp .env-example .env      # add your HF_TOKEN, set a VNC_PW
-docker compose up -d      # first run downloads ~22 GB of weights
+./model use 27b           # first run downloads ~22 GB of weights
 ```
+
+### Choosing the model
+
+Two models are wired up; the 121 GiB pool holds one at a time, so `./model` switches
+between them (stops the other, updates `.env`, waits for the API, recreates the desktop):
+
+| | `./model use 27b` | `./model use flash` |
+|---|---|---|
+| Model | `nvidia/Qwen3.8-27B-NVFP4` | `nvidia/Qwen3.8-Flash-Next-NVFP4` (125B / 6B active) |
+| Served by | the compose `vllm` service, port 8000 | [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX), container `qwen38-flash`, port 18300 |
+| Weights / free memory left | ~21 GiB / ~46 GiB | ~77 GiB / ~12 GiB |
+| Decode, one request (measured) | ~30 tok/s | ~38 tok/s |
+
+`./model status` shows which one is up. Flash needs the recipe checked out at
+`~/localAI/qwen3.8-Flash-DGX`; its parameters, and why each was chosen, are in
+`flash/serve-flash.sh`.
 
 Then point your MCP client at the bridge:
 

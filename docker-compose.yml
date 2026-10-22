@@ -1,7 +1,19 @@
 # docker-compose.yml
-# vLLM serving for nvidia/Qwen3.8-27B-NVFP4 on DGX Spark
-# (GB10, aarch64, 121 GiB unified memory).
+# A GUI desktop for agents plus the local model that drives it, on DGX Spark
+# (GB10, aarch64, 121 GiB unified memory). Two models are supported, one at a time
+# (the unified pool holds only one big model), chosen with COMPOSE_PROFILES in .env:
 #
+#   27b    nvidia/Qwen3.8-27B-NVFP4 in the `vllm` service below, port 8000.
+#   flash  nvidia/Qwen3.8-Flash-Next-NVFP4 (125B total / 6B active MoE), served by the
+#          blazux recipe (~/localAI/qwen3.8-Flash-DGX) in its own container
+#          "qwen38-flash" on port 18300, started by flash/serve-flash.sh -- not a compose
+#          service, because the recipe's `docker run` mounts its own patches.
+#
+# Switch with `./model use 27b|flash`: it stops the other model, sets COMPOSE_PROFILES,
+# MODEL_BASE_URL and CUA_MODEL_NAME in .env, starts the model, waits for its API and
+# recreates the desktop. `./model status` shows what is running.
+#
+# The 27B notes:
 # Swapped from unsloth/Qwen3.8-27B-NVFP4 on 2026-10-21: same base model, NVIDIA's
 # ModelOpt quantization decoded ~24% faster in the community NVFP4 shootout
 # (huggingface.co/Qwen/Qwen3.8-27B/discussions/192: 38.6 vs 31.2 tok/s, MBPP 70.4
@@ -22,7 +34,7 @@
 # The weights (20.4 GiB, revision 482ca0f) are already in the bind-mounted host
 # cache below; on a fresh box the first start downloads them. Expect a long first boot.
 #
-# Start:      docker compose up -d
+# Start:      ./model use 27b        (or plain `docker compose up -d` with profile 27b)
 # vLLM logs:  docker compose logs -f vllm
 # Test vLLM:  curl -sS http://127.0.0.1:8000/v1/models | jq -r '.data[0].id'
 
@@ -30,12 +42,14 @@ services:
   vllm:
     # Pinned by digest: the official vLLM v0.31.0 image (2026-10-22). ':latest' floats
     # and would eventually change under you, taking the CUDA build with it. Same base
-    # as the Flash fork's recipe image (qwen38-flash-dgx:v0.31), so the two stacks share
+    # as the Flash recipe's image (qwen38-flash-dgx:v0.31), so the two models share
     # every layer on disk instead of keeping a second ~22 GB vLLM image around.
     # Rollback: vLLM 0.30.0 / torch 2.13.0+cu130, ran here 2026-10-01 to 2026-10-22:
     #   vllm/vllm-openai@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90
     image: vllm/vllm-openai@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3
     container_name: qwen-3.8-27b-spark
+    # Only with COMPOSE_PROFILES=27b; under "flash" the model runs outside compose.
+    profiles: ["27b"]
     restart: unless-stopped
     ipc: host
 
@@ -259,10 +273,12 @@ services:
       # The base image ships a well-known default password. Even though every port is
       # bound to loopback only, don't run with it.
       VNC_PW: ${VNC_PW:?VNC_PW is not set - see .env}
-      # "qwen35-27b" must match cua's loop-selection regex r"(?i).*qwen35.*" --
-      # see the --served-model-name comment in the vllm service.
-      CUA_MODEL_NAME: openai/qwen35-27b
-      OPENAI_BASE_URL: http://host.docker.internal:8000/v1
+      # Which model the vision loop talks to -- set by `./model use` in .env. The name
+      # must contain "qwen35": cua picks its loop with the regex r"(?i).*qwen35.*" and
+      # silently falls back to a weaker generic loop otherwise. Both served models are
+      # named accordingly (qwen35-27b, qwen35-flash-next); see --served-model-name below.
+      CUA_MODEL_NAME: ${CUA_MODEL_NAME:-openai/qwen35-27b}
+      OPENAI_BASE_URL: ${MODEL_BASE_URL:-http://host.docker.internal:8000/v1}
       OPENAI_API_KEY: EMPTY
       CUA_MAX_IMAGES: "3"
       CUA_TELEMETRY_ENABLED: "false"
@@ -275,11 +291,14 @@ services:
       # Recorded sessions and generated replay scripts, readable from the host.
       - ./trajectories:/trajectories
 
-    # vLLM must be answering before the desktop's agent loop is useful. The vllm
-    # healthcheck has a 15m start_period, so this can wait a long time on a cold boot.
+    # With the 27b profile, vLLM must be answering before the desktop's agent loop is
+    # useful; its healthcheck has a 15m start_period, so this can wait a long time on a
+    # cold boot. `required: false` lets the desktop start alone under the flash profile,
+    # where the model is not a compose service (./model waits for its API instead).
     depends_on:
       vllm:
         condition: service_healthy
+        required: false
 
     # NOTE on the 6901 check: KasmVNC answers 401 until you authenticate, and `curl -f`
     # treats any 4xx as failure (exit 22). The obvious `curl -sf http://localhost:6901`
