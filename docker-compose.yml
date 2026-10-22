@@ -223,6 +223,13 @@ services:
     # Firefox needs more than the default 64 MiB of /dev/shm or tabs crash.
     shm_size: 1gb
 
+    # Cap the desktop so a runaway browser tab is killed inside this container instead
+    # of pushing the shared 121 GiB pool into swap or waking the host OOM killer, which
+    # may pick vLLM. Normal use is ~2 GiB. Seen 2026-10-22: an agent's browser_eval
+    # returned a whole editor document model and the content process allocated ~600 MB/s.
+    mem_limit: 8g
+    memswap_limit: 8g
+
     # How the container reaches the model. vLLM listens on the host, not in this
     # container, so host.docker.internal is mapped to the docker bridge gateway.
     extra_hosts:
