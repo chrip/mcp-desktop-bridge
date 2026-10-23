@@ -82,7 +82,7 @@ case "${1:-status}" in
                 else
                     flash/serve-flash.sh
                 fi
-                wait_api 18300 qwen35-flash-next "$FLASH_CONTAINER"
+                wait_api 18300 qwen3.8-flash-next "$FLASH_CONTAINER"
                 adopt_desktop
                 docker compose up -d desktop
                 ;;

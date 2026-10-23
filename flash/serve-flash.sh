@@ -14,7 +14,12 @@
 #                  dev stack, gui desktop) uses ~18 GiB, leaving ~12 GiB free; the recipe's
 #                  0.80 long-run setting would leave almost nothing.
 #   MTP=2          the recipe's quality-first default (MTP=3: +7% decode, -1 tournament point).
-#   SERVED_MODEL_NAME=qwen35-flash-next   must contain "qwen35" for cua's vision loop.
+#   Served names: "qwen3.8-flash-next" is the real name -- clients (opencode) use it, and it
+#                  ends up in Assisted-by trailers, so it must name the actual model version.
+#                  "qwen35-flash-next" is only an alias for the desktop bridge: cua picks its
+#                  Qwen vision loop with the regex r"(?i).*qwen35.*". Same pattern as the 27B
+#                  (qwen3.8-27b + qwen35-27b). serve.sh accepts one name, so the full list is
+#                  passed again via EXTRA, which comes later on the command line and wins.
 set -euo pipefail
 RECIPE="${RECIPE:-$HOME/localAI/qwen3.8-Flash-DGX}"
 export HF_CACHE="${HF_CACHE:-$HOME/hf-cache/huggingface}"
@@ -24,5 +29,6 @@ exec "$RECIPE/flash" serve native \
   CTX="${CTX:-163840}" \
   GPU_MEM="${GPU_MEM:-0.75}" \
   MTP="${MTP:-2}" \
-  SERVED_MODEL_NAME=qwen35-flash-next \
+  SERVED_MODEL_NAME=qwen3.8-flash-next \
+  EXTRA="--served-model-name qwen3.8-flash-next qwen35-flash-next" \
   PORT=18300
