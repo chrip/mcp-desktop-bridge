@@ -6,7 +6,13 @@
 #   MODE=nvfp4     NVIDIA's checkpoint exactly as published. The recipe's faster
 #                  "hybrid" layout rewrites the dense side layers to fp8 with a community
 #                  script (+~20% decode); we prefer NVIDIA's own weights unmodified.
-#   CTX=163840     matches opencode's limit.context for this model (compaction at ~131k).
+#   CTX=196608     32k above opencode's limit.context (163840). opencode 1.19 decides to
+#                  compact from the previous response's token count (at context - output =
+#                  131072), so the tool results added since can push the next prompt past
+#                  131072; with max_tokens=32768 on top, a CTX equal to limit.context makes
+#                  vLLM reject that request (ContextOverflowError, seen 2026-10-24). The slack
+#                  absorbs the overshoot, as --max-model-len=262144 does for the 27B. The KV
+#                  cache at GPU_MEM=0.75 holds 206,165 tokens, so 196608 still fits one request.
 #                  No YaRN: Qwen notes static YaRN can hurt short-context quality.
 #   GPU_MEM=0.75   ~91 GiB. Measured 2026-10-22: at 0.70 weights + overhead left only
 #                  0.35 GiB of KV, while 163840 tokens need 4.91 GiB (bf16), so ~0.745 is
@@ -26,7 +32,7 @@ export HF_CACHE="${HF_CACHE:-$HOME/hf-cache/huggingface}"
 exec "$RECIPE/flash" serve native \
   MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4 \
   MODE=nvfp4 \
-  CTX="${CTX:-163840}" \
+  CTX="${CTX:-196608}" \
   GPU_MEM="${GPU_MEM:-0.75}" \
   MTP="${MTP:-2}" \
   SERVED_MODEL_NAME=qwen3.8-flash-next \
